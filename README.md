@@ -103,6 +103,156 @@ print(
 )
 ```
 
+## Personal Hermes
+
+OpenMythos also includes Personal Hermes: a resident local mind built around a
+persona, durable memory, growth state, and any text generator you plug in. The
+terminal chat is only the first interface; the home folder is the important part
+because it keeps identity, memory, journal, trust lessons, and level progression
+across restarts.
+
+```python
+from open_mythos.personal_ai import JsonMemoryStore, PersonalAI, PersonalAIProfile
+
+
+def generator(prompt: str, **kwargs) -> str:
+    # Replace this with OpenMythosTextGenerator, an API client, or another model.
+    return "I have the context and I am ready to help."
+
+
+ai = PersonalAI(
+    profile=PersonalAIProfile(name="Hermes", owner_name="Woady"),
+    memory_store=JsonMemoryStore("personal_ai_memory.json"),
+    generator=generator,
+)
+
+ai.remember(
+    "Woady prefers concise engineering updates.",
+    kind="preference",
+    tags=["work-style"],
+    importance=1.4,
+)
+
+response = ai.reply("Help me plan the next OpenMythos milestone.")
+print(response.text)
+```
+
+See [`examples/personal_ai_example.py`](examples/personal_ai_example.py) for a
+complete runnable starter.
+
+### Give It A Home
+
+Start the local mind chat:
+
+```bash
+openmythos-hermes
+# or, from the repo:
+python -m open_mythos.chat
+```
+
+Start the Hermes resident agent with a browser UI and background task runner:
+
+```bash
+openmythos-hermes-agent --backend ollama --model gemma4:e4b
+# or, from the repo:
+python -m open_mythos.resident_agent --backend ollama --model gemma4:e4b
+```
+
+Allow the resident agent to learn from a project folder:
+
+```bash
+python -m open_mythos.resident_agent --backend ollama --model gemma4:e4b --allow-root ~/Projects/OpenMythos
+```
+
+Use the bootstrap voice only as a tiny fallback when you do not want a model:
+
+```bash
+python -m open_mythos.resident_agent --backend bootstrap
+```
+
+Enable live research tools for cited web/weather answers:
+
+```bash
+python -m open_mythos.resident_agent \
+  --backend ollama \
+  --model gemma4:e4b \
+  --enable-research \
+  --weather-location "Miami, FL" \
+  --auto-reflect-every 10
+```
+
+If Ollama is running, the chat uses a local model by default:
+
+```bash
+python -m open_mythos.chat --backend ollama --model gemma4:e4b
+```
+
+Use the tiny built-in bootstrap voice only when you do not want a model backend:
+
+```bash
+python -m open_mythos.chat --backend bootstrap
+```
+
+By default its home lives at `~/.open_mythos/mind` and contains:
+
+| File/folder | Purpose |
+|---|---|
+| `profile.json` | Name, identity, traits, and operating principles |
+| `state.json` | Persistent level, XP, interaction count, and trust stats |
+| `growth.jsonl` | Append-only growth ledger for XP and level events |
+| `memory.json` | Durable memories it recalls across conversations |
+| `hermes_memory.md` | Readable conversation transcript |
+| `journal.jsonl` | Conversation journal |
+| `continuity.json` | Rolling conversation state for resuming later |
+| `tasks.json` | Persistent resident-agent task queue |
+| `sources.jsonl` | Files and folders it has learned from |
+| `inbox/` | Drop zone for notes you want to feed it later |
+| `knowledge/` | Place to keep local knowledge files |
+
+Inside chat:
+
+```text
+/remember I prefer concise engineering updates.
+/trust Never delete files unless I explicitly ask.
+/learn README.md
+/seed
+/level
+/recall engineering updates
+/home
+/quit
+```
+
+The level system starts at level 1 and grows from lifetime XP. Conversations,
+explicit memories, learned files, seed knowledge, and trust/correction lessons
+all leave persistent growth events. Level is derived from total XP, so it can
+continue indefinitely and is not lost when the process exits.
+
+Continuity is explicit. Every exchange updates `journal.jsonl`, the readable
+transcript, and `continuity.json`. Normal chat prompts include recent exchanges
+plus the rolling continuity summary, and resume prompts such as `continue` or
+`where were we?` return a grounded recap instead of guessing.
+
+The Hermes resident agent binds to `127.0.0.1` by default, serves a local web
+UI, and runs queued tasks in the background. File-learning tasks are permission
+checked: the agent can only learn from its own home folder plus paths you pass
+with `--allow-root`. Research is explicit: without `--enable-research`, current
+questions are refused instead of guessed. With research enabled, weather uses
+Open-Meteo and web lookup uses DuckDuckGo Instant Answer results, returning
+source URLs and `verified` metadata.
+
+Growth is explicit too. The resident task queue supports `learn_allowed_roots`
+to learn approved folders, `learn_inbox` to ingest notes dropped in `inbox/`,
+`reflect` to compress recent journal entries into a durable lesson, `trust` for
+high-priority corrections, `growth_plan` to show what Hermes still lacks, and
+`briefing` to produce a grounded status report with weak spots and next moves.
+Source learning records fingerprints, so unchanged files are skipped instead of
+duplicating memory and inflating XP. `--auto-reflect-every N` queues reflection
+jobs after every N normal exchanges.
+
+The first boot can use `BootstrapMindGenerator`, a tiny local response engine
+that can talk, remember, and recall without model weights. For richer language,
+use `OllamaGenerator`, `OpenMythosTextGenerator`, or another callable generator.
+
 
 
 ## Model Variants

@@ -35,6 +35,12 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
 ]
 
+[tool.poetry.scripts]
+openmythos-hermes = "open_mythos.chat:main"
+openmythos-hermes-agent = "open_mythos.resident_agent:main"
+open-mythos-mind = "open_mythos.chat:main"
+open-mythos-agent = "open_mythos.resident_agent:main"
+
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"

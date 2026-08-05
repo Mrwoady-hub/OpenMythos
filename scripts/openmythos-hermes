@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/woady/Projects/OpenMythos
+exec python -m open_mythos.chat "$@"
