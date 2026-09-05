@@ -9,6 +9,10 @@ gate01-unit:
 gate01-inputs:
 	scripts/gate01/fetch-inputs.sh
 
+.PHONY: gate01-toolchain
+gate01-toolchain:
+	scripts/gate01/build-toolchain.sh
+
 gate01-config:
 	scripts/gate01/generate-config.sh --check
 
