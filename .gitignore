@@ -294,6 +294,19 @@ flycheck_*.el
 # network security
 /network-security.data
 
+# Stone Boot Proof Gate 01 outputs and secrets
+/.superpowers/
+/build/
+/dist/
+**/__pycache__/
+*.py[cod]
+*.pem
+*.key
+*.p12
+*.qcow2
+*.oci.tar
+*.rpm
+
 # Agent Skills - User-created skill directories
 # Keep example_skills/ committed for reference
 # Ignore common user skill directory patterns
