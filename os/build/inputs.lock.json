@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "architecture": "x86_64",
+  "fedora_bootc": {
+    "reference": "quay.io/fedora/fedora-bootc",
+    "tag_observed": "44",
+    "version": "44.20260905.0",
+    "index_digest": "sha256:778cafb9040cd2fb91d3ae7bf68bff6e775714cdd6ee47cbd9970646c40fd2cf",
+    "manifest_digest": "sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756"
+  },
+  "image_builder": {
+    "reference": "ghcr.io/osbuild/image-builder-cli",
+    "index_digest": "sha256:8605bd61eb884a403736c8cc201a1fbd5b0dcdcf58988902cb65753867934353",
+    "manifest_digest": "sha256:b44e26d185916d28a88bbc04faa986ccc44535691715f1bc276523693b19ccca"
+  },
+  "root_filesystem": "ext4"
+}

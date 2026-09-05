@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Gate 01 is x86_64 and UEFI-only.
-- The base is Fedora 44 bootc, pinned to x86_64 manifest `sha256:2507c4ffbc1e629977b273aebc4c989becf3900d3e677f5813fd423d978fcdb7` from index `sha256:a531996fe58a57155b5c67a8d008f2fff3b750d3dcb9ffe92f704925193e86a4`, image version `44.20260902.0`.
+- The base is Fedora 44 bootc, pinned to x86_64 manifest `sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756` from index `sha256:778cafb9040cd2fb91d3ae7bf68bff6e775714cdd6ee47cbd9970646c40fd2cf`, image version `44.20260905.0`.
 - The disk converter is unified `image-builder`, pinned to x86_64 manifest `sha256:b44e26d185916d28a88bbc04faa986ccc44535691715f1bc276523693b19ccca` from index `sha256:8605bd61eb884a403736c8cc201a1fbd5b0dcdcf58988902cb65753867934353`.
 - The kernel source is upstream Linux 6.18.48. Its `linux-6.18.48.tar.xz` SHA-256 is `5ebdadb10a4b5708fc6b1c457764a110bc49f8150cc3502c59b921ead8c6fc8c`; its detached signature SHA-256 is `71abbb7d63d2978f1c8ed42bae650ec33a6039fe085f39178e4815bbed583dbc`.
 - The kernel.org signer must be Greg Kroah-Hartman, fingerprint `647F28654894E3BD457199BE38DBBDC86092693E`.
@@ -356,9 +356,9 @@ Expected: `ERROR` because `tools.gate01.inputs` does not exist.
   "fedora_bootc": {
     "reference": "quay.io/fedora/fedora-bootc",
     "tag_observed": "44",
-    "version": "44.20260902.0",
-    "index_digest": "sha256:a531996fe58a57155b5c67a8d008f2fff3b750d3dcb9ffe92f704925193e86a4",
-    "manifest_digest": "sha256:2507c4ffbc1e629977b273aebc4c989becf3900d3e677f5813fd423d978fcdb7"
+    "version": "44.20260905.0",
+    "index_digest": "sha256:778cafb9040cd2fb91d3ae7bf68bff6e775714cdd6ee47cbd9970646c40fd2cf",
+    "manifest_digest": "sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756"
   },
   "image_builder": {
     "reference": "ghcr.io/osbuild/image-builder-cli",
@@ -523,7 +523,7 @@ def validate_external_inputs(raw: dict[str, Any]) -> None:
     _require_exact_fields(builder, IMAGE_BUILDER_FIELDS, "image_builder")
     if fedora["reference"] != "quay.io/fedora/fedora-bootc":
         raise ValueError("unexpected Fedora bootc repository")
-    if fedora["tag_observed"] != "44" or fedora["version"] != "44.20260902.0":
+    if fedora["tag_observed"] != "44" or fedora["version"] != "44.20260905.0":
         raise ValueError("unexpected Fedora bootc version metadata")
     if builder["reference"] != "ghcr.io/osbuild/image-builder-cli":
         raise ValueError("unexpected image-builder repository")
@@ -752,7 +752,7 @@ Expected: `ERROR` because `tools.gate01.toolchain` does not exist.
 
 ```dockerfile
 # os/kernel/Containerfile.builder
-FROM quay.io/fedora/fedora-bootc@sha256:2507c4ffbc1e629977b273aebc4c989becf3900d3e677f5813fd423d978fcdb7
+FROM quay.io/fedora/fedora-bootc@sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756
 
 RUN dnf -y install \
       bash bc binutils bison cpio diffutils dwarves \
@@ -767,7 +767,7 @@ RUN test "$(rpm --eval '%{?dist}')" = ".fc44" \
 
 LABEL org.opencontainers.image.title="OpenMythos Linux 6.18 Gate 01 builder" \
       org.opencontainers.image.source="https://github.com/The-Swarm-Corporation/OpenMythos" \
-      org.opencontainers.image.base.digest="sha256:2507c4ffbc1e629977b273aebc4c989becf3900d3e677f5813fd423d978fcdb7"
+      org.opencontainers.image.base.digest="sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756"
 ```
 
 This is the only step allowed to resolve Fedora RPM repositories. The resulting OCI archive, not a future rebuild of this Containerfile, is the toolchain input used by the reproducibility proof.
@@ -1611,7 +1611,7 @@ Enable the timer in the payload. Without the kernel argument it does not activat
 `os/images/gate01/Containerfile` starts from the exact Fedora manifest digest and sets `LABEL containers.bootc=1`. It consumes RPMs and the realtime shim only through ephemeral read-only build volumes:
 
 ```dockerfile
-FROM quay.io/fedora/fedora-bootc@sha256:2507c4ffbc1e629977b273aebc4c989becf3900d3e677f5813fd423d978fcdb7
+FROM quay.io/fedora/fedora-bootc@sha256:d6481b291e960abb02a346294dcac2818df8dfe2b1bc51d1ae8fa53a15718756
 
 LABEL containers.bootc="1" \
       org.opencontainers.image.title="OpenMythos OS Stone Boot Proof" \

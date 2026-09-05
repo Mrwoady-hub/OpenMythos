@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "product": "linux-openmythos",
+  "version": "6.18.48",
+  "archive_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.48.tar.xz",
+  "archive_sha256": "sha256-is-not-accepted-here",
+  "signature_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.48.tar.sign",
+  "signature_sha256": "71abbb7d63d2978f1c8ed42bae650ec33a6039fe085f39178e4815bbed583dbc",
+  "signer_fingerprint": "647F28654894E3BD457199BE38DBBDC86092693E",
+  "source_date_epoch": 1787899659,
+  "patches": []
+}
