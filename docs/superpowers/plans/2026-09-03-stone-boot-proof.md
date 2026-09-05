@@ -1084,7 +1084,7 @@ CONFIG_VIRTIO_PCI=y
 CONFIG_VIRTIO_PCI_LEGACY=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_CONSOLE=y
-CONFIG_VIRTIO_SCSI=y
+CONFIG_SCSI_VIRTIO=y
 CONFIG_VIRTIO_NET=m
 CONFIG_NET_FAILOVER=m
 CONFIG_FAILOVER=m
@@ -1139,6 +1139,7 @@ The Fedora config is the compatibility baseline; this fragment is the reviewed O
     "CONFIG_MODULE_SIG_HASH": "\"sha256\"",
     "CONFIG_MODULE_SIG_KEY": "\"\"",
     "CONFIG_MODULE_SIG_SHA256": "y",
+    "CONFIG_SCSI_VIRTIO": "y",
     "CONFIG_SECONDARY_TRUSTED_KEYRING": "y",
     "CONFIG_SECURITYFS": "y",
     "CONFIG_SECURITY_LOCKDOWN_LSM": "y",
@@ -1151,8 +1152,7 @@ The Fedora config is the compatibility baseline; this fragment is the reviewed O
     "CONFIG_VIRTIO_BLK": "y",
     "CONFIG_VIRTIO_CONSOLE": "y",
     "CONFIG_VIRTIO_NET": "m",
-    "CONFIG_VIRTIO_PCI": "y",
-    "CONFIG_VIRTIO_SCSI": "y"
+    "CONFIG_VIRTIO_PCI": "y"
   }
 }
 ```
