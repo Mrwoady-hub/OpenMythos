@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -139,6 +141,52 @@ class KernelConfigTests(unittest.TestCase):
                 "3b92cd4fae933696dbec362bc1348c6e28c42d9a1a593add03bb69ce02f97f1c  sample.config\n",
             )
             self.assertFalse(output.with_name(output.name + ".tmp").exists())
+
+    def test_preexisting_container_store_survives_losing_generator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            script = repo / "scripts/gate01/generate-config.sh"
+            script.parent.mkdir(parents=True)
+            shutil.copy2(REPO / "scripts/gate01/generate-config.sh", script)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+            store = repo / "build/gate01/config-work/store"
+            store.mkdir(parents=True)
+            sentinel = store / "owned-by-another-generator"
+            sentinel.write_text("keep\n", encoding="ascii")
+
+            fake_bin = Path(directory) / "bin"
+            fake_bin.mkdir()
+            fake_podman = fake_bin / "podman"
+            fake_podman.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ $1 == unshare ]] || exit 99\n"
+                "shift\n"
+                "exec \"$@\"\n",
+                encoding="ascii",
+            )
+            fake_podman.chmod(0o755)
+            fake_id = fake_bin / "id"
+            fake_id.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ $1 == -u ]] || exit 99\n"
+                "printf '1000\\n'\n",
+                encoding="ascii",
+            )
+            fake_id.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            result = subprocess.run(
+                [str(script), "--check"],
+                cwd=repo,
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("disposable container store already exists", result.stderr)
+            self.assertTrue(sentinel.exists(), "losing generator deleted owned store")
 
     @staticmethod
     def _minimal_requirements() -> dict[str, object]:

@@ -58,13 +58,13 @@ cleanup() {
     podman unshare rm -rf -- "$resolved_store"
   fi
 }
-trap cleanup EXIT
 
 mkdir -p -- "$config_work"
-if [[ -e $store ]]; then
+if ! mkdir -- "$store" 2>/dev/null; then
   echo "disposable container store already exists: $store" >&2
   exit 1
 fi
+trap cleanup EXIT
 mkdir -p -- "$store/root" "$store/runroot"
 work=$(mktemp -d -- "$config_work/work.XXXXXXXX")
 
