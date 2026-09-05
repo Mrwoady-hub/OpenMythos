@@ -1,0 +1,47 @@
+{
+  "binary_rpms": [
+    {
+      "architecture": "x86_64",
+      "epoch": "0",
+      "files": [],
+      "name": "kernel-openmythos",
+      "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64",
+      "release": "1.openmythos.fc44",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": "6.18.48"
+    },
+    {
+      "architecture": "x86_64",
+      "epoch": "0",
+      "files": [],
+      "name": "kernel-openmythos-core",
+      "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64",
+      "release": "1.openmythos.fc44",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "version": "6.18.48"
+    },
+    {
+      "architecture": "x86_64",
+      "epoch": "0",
+      "files": [],
+      "name": "kernel-openmythos-modules",
+      "nevra": "kernel-openmythos-modules-6.18.48-1.openmythos.fc44.x86_64",
+      "release": "1.openmythos.fc44",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "version": "6.18.48"
+    }
+  ],
+  "kernel_release": "6.18.48-1.openmythos.fc44.x86_64",
+  "schema_version": 1,
+  "source_rpms": [
+    {
+      "architecture": "src",
+      "epoch": "0",
+      "name": "kernel-openmythos",
+      "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.src",
+      "release": "1.openmythos.fc44",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "version": "6.18.48"
+    }
+  ]
+}
