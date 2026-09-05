@@ -14,9 +14,13 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 1
+SCAN_CHUNK_SIZE = 64 * 1024
+MAX_MARKER_CANDIDATE = 4096
+PRIVATE_KEY_MARKER_STARTS = (b"-----BEGIN ", b"-----END ")
 PRIVATE_KEY_MARKER = re.compile(
     rb"-----(?:BEGIN|END) [^-\r\n]*PRIVATE KEY-----"
 )
+PARTIAL_PRIVATE_KEY_MARKER = re.compile(rb"[^-\r\n]*PRIVATE KEY-{1,4}$")
 
 
 def _openssl(arguments: list[str], *, input_bytes: bytes | None = None) -> bytes:
@@ -91,51 +95,159 @@ def describe(certificate: Path, output: Path) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
+def _identity(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def _version(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _require_identity(
+    expected: os.stat_result,
+    observed: os.stat_result,
+    kind: str,
+    relative_path: Path,
+) -> None:
+    if _identity(expected) != _identity(observed):
+        raise RuntimeError(
+            f"{kind} identity changed during traversal: {relative_path.as_posix()}"
+        )
+
+
+def _stat_at(
+    name: str, directory_descriptor: int, kind: str, relative_path: Path
+) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError(
+            f"{kind} identity changed during traversal: {relative_path.as_posix()}"
+        ) from error
+
+
+def _marker_carry(data: bytes) -> tuple[bool, bytes]:
+    if PRIVATE_KEY_MARKER.search(data) is not None:
+        return True, b""
+
+    starts = [(data.rfind(prefix), prefix) for prefix in PRIVATE_KEY_MARKER_STARTS]
+    start_at, prefix = max(starts, key=lambda item: item[0])
+    if start_at >= 0:
+        candidate = data[start_at:]
+        body = candidate[len(prefix) :]
+        if b"\n" not in body and b"\r" not in body:
+            if b"-" not in body or PARTIAL_PRIVATE_KEY_MARKER.fullmatch(body):
+                if len(candidate) >= MAX_MARKER_CANDIDATE:
+                    return True, b""
+                return False, candidate
+
+    carry_size = max(len(prefix) for prefix in PRIVATE_KEY_MARKER_STARTS) - 1
+    return False, data[-carry_size:]
+
+
+def _descriptor_contains_secret(
+    descriptor: int, exact_patterns: tuple[bytes, bytes]
+) -> bool:
+    exact_carry = b""
+    marker_carry = b""
+    exact_carry_size = max(len(pattern) for pattern in exact_patterns) - 1
+
+    while chunk := os.read(descriptor, SCAN_CHUNK_SIZE):
+        exact_data = exact_carry + chunk
+        if any(pattern in exact_data for pattern in exact_patterns):
+            return True
+        exact_carry = exact_data[-exact_carry_size:]
+
+        marker_found, marker_carry = _marker_carry(marker_carry + chunk)
+        if marker_found:
+            return True
+    return False
+
+
+def _scan_directory(
+    directory_descriptor: int,
+    relative_directory: Path,
+    exact_patterns: tuple[bytes, bytes],
+    offenders: list[str],
+) -> None:
+    directory_before = os.fstat(directory_descriptor)
+    with os.scandir(directory_descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    for name in names:
+        relative_path = relative_directory / name
+        before = _stat_at(name, directory_descriptor, "entry", relative_path)
+        if stat.S_ISDIR(before.st_mode):
+            child_descriptor = os.open(
+                name, directory_flags, dir_fd=directory_descriptor
+            )
+            try:
+                opened = os.fstat(child_descriptor)
+                _require_identity(before, opened, "directory", relative_path)
+                _scan_directory(
+                    child_descriptor, relative_path, exact_patterns, offenders
+                )
+                after = _stat_at(
+                    name, directory_descriptor, "directory", relative_path
+                )
+                _require_identity(opened, after, "directory", relative_path)
+            finally:
+                os.close(child_descriptor)
+        elif stat.S_ISREG(before.st_mode):
+            file_descriptor = os.open(name, file_flags, dir_fd=directory_descriptor)
+            try:
+                opened = os.fstat(file_descriptor)
+                _require_identity(before, opened, "file", relative_path)
+                matched = _descriptor_contains_secret(file_descriptor, exact_patterns)
+                if _version(opened) != _version(os.fstat(file_descriptor)):
+                    raise RuntimeError(
+                        "file changed during traversal: "
+                        f"{relative_path.as_posix()}"
+                    )
+                after = _stat_at(name, directory_descriptor, "file", relative_path)
+                _require_identity(opened, after, "file", relative_path)
+                if matched:
+                    offenders.append(relative_path.as_posix())
+            finally:
+                os.close(file_descriptor)
+
+    if _version(directory_before) != _version(os.fstat(directory_descriptor)):
+        display_path = relative_directory.as_posix() or "."
+        raise RuntimeError(
+            f"directory identity changed during traversal: {display_path}"
+        )
+
+
 def scan(private_key: Path, root: Path) -> int:
     private_key_pem = private_key.read_bytes()
     private_key_der = _openssl(
         ["pkey", "-in", os.fspath(private_key), "-outform", "DER"]
     )
+    exact_patterns = (private_key_pem, private_key_der)
     resolved_root = root.resolve(strict=True)
-    if not resolved_root.is_dir():
+    root_before = os.stat(resolved_root, follow_symlinks=False)
+    if not stat.S_ISDIR(root_before.st_mode):
         raise NotADirectoryError(resolved_root)
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root_descriptor = os.open(resolved_root, directory_flags)
     offenders: list[str] = []
-
-    def raise_walk_error(error: OSError) -> None:
-        raise error
-
-    for directory, directory_names, file_names in os.walk(
-        resolved_root, followlinks=False, onerror=raise_walk_error
-    ):
-        directory_path = Path(directory)
-        directory_names[:] = [
-            name
-            for name in directory_names
-            if not (directory_path / name).is_symlink()
-        ]
-        for name in file_names:
-            candidate = directory_path / name
-            candidate_stat = candidate.lstat()
-            if not stat.S_ISREG(candidate_stat.st_mode):
-                continue
-            descriptor = os.open(
-                candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise ValueError(f"file changed during scan: {candidate}")
-                with os.fdopen(descriptor, "rb") as stream:
-                    descriptor = -1
-                    contents = stream.read()
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            if (
-                private_key_pem in contents
-                or private_key_der in contents
-                or PRIVATE_KEY_MARKER.search(contents) is not None
-            ):
-                offenders.append(candidate.relative_to(resolved_root).as_posix())
+    try:
+        opened_root = os.fstat(root_descriptor)
+        _require_identity(root_before, opened_root, "directory", Path("."))
+        _scan_directory(root_descriptor, Path(), exact_patterns, offenders)
+        root_after = os.stat(resolved_root, follow_symlinks=False)
+        _require_identity(opened_root, root_after, "directory", Path("."))
+    finally:
+        os.close(root_descriptor)
 
     for offender in sorted(offenders):
         print(offender)

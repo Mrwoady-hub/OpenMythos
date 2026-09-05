@@ -1,9 +1,14 @@
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
+
+from tools.gate01 import module_key
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -141,6 +146,18 @@ class ModuleKeyScanTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        self.private_der = subprocess.run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                os.fspath(self.private_key),
+                "-outform",
+                "DER",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
 
     def scan(self) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -218,6 +235,106 @@ class ModuleKeyScanTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
+
+    def test_scan_fails_closed_when_opened_directory_is_replaced(self) -> None:
+        ancestor = self.scan_root / "ancestor"
+        ancestor.mkdir()
+        (ancestor / "payload.bin").write_bytes(self.private_key.read_bytes())
+        clean = self.root / "clean"
+        clean.mkdir()
+        (clean / "payload.bin").write_bytes(b"public data\n")
+        displaced = self.root / "displaced"
+        real_open = os.open
+        attacked = False
+
+        def replace_ancestor_before_file_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal attacked
+            if not attacked and Path(os.fspath(path)).name == "payload.bin":
+                ancestor.rename(displaced)
+                ancestor.symlink_to(clean, target_is_directory=True)
+                attacked = True
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(module_key, "_openssl", return_value=self.private_der):
+            with mock.patch.object(
+                module_key.os, "open", side_effect=replace_ancestor_before_file_open
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "directory identity changed"
+                ):
+                    module_key.scan(self.private_key, self.scan_root)
+        self.assertTrue(attacked)
+
+    def test_scan_detects_secrets_and_markers_across_chunk_boundaries(self) -> None:
+        chunk_size = 64
+        padding = b"x" * (chunk_size - 3)
+        marker = b"".join(
+            [b"-----BEGIN ", b"ENCRYPTED PRIVATE KEY", b"-----"]
+        )
+        (self.scan_root / "der.bin").write_bytes(padding + self.private_der)
+        (self.scan_root / "marker.bin").write_bytes(padding + marker)
+        (self.scan_root / "pem.bin").write_bytes(
+            padding + self.private_key.read_bytes()
+        )
+        real_read = os.read
+        read_sizes: list[int] = []
+
+        def record_bounded_read(descriptor: int, size: int) -> bytes:
+            read_sizes.append(size)
+            return real_read(descriptor, size)
+
+        scan_output = io.StringIO()
+        with mock.patch.object(module_key, "SCAN_CHUNK_SIZE", chunk_size, create=True):
+            with mock.patch.object(
+                module_key, "_openssl", return_value=self.private_der
+            ):
+                with mock.patch.object(
+                    module_key.os, "read", side_effect=record_bounded_read
+                ):
+                    with redirect_stdout(scan_output):
+                        result = module_key.scan(self.private_key, self.scan_root)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            scan_output.getvalue().splitlines(),
+            ["der.bin", "marker.bin", "pem.bin"],
+        )
+        self.assertTrue(read_sizes, "scanner bypassed bounded os.read calls")
+        self.assertLessEqual(max(read_sizes), chunk_size)
+
+    def test_scan_reads_large_sparse_file_in_bounded_chunks(self) -> None:
+        chunk_size = 64 * 1024
+        sparse = self.scan_root / "large-sparse.bin"
+        with sparse.open("wb") as stream:
+            stream.seek(chunk_size * 16)
+            stream.write(b"public data\n")
+        real_read = os.read
+        read_sizes: list[int] = []
+
+        def record_bounded_read(descriptor: int, size: int) -> bytes:
+            read_sizes.append(size)
+            return real_read(descriptor, size)
+
+        with mock.patch.object(module_key, "SCAN_CHUNK_SIZE", chunk_size, create=True):
+            with mock.patch.object(
+                module_key, "_openssl", return_value=self.private_der
+            ):
+                with mock.patch.object(
+                    module_key.os, "read", side_effect=record_bounded_read
+                ):
+                    result = module_key.scan(self.private_key, self.scan_root)
+
+        self.assertEqual(result, 0)
+        self.assertGreater(len(read_sizes), 16)
+        self.assertLessEqual(max(read_sizes), chunk_size)
 
 
 class DevelopmentKeyScriptTests(unittest.TestCase):
