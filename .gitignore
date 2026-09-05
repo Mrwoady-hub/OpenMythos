@@ -1,3 +1,7 @@
+# OpenMythos isolated development workspaces
+/.worktrees/
+/.superpowers/
+
 __pycache__/
 .venv/
 
@@ -427,4 +431,3 @@ flycheck_*.el
 
 # network security
 /network-security.data
-
