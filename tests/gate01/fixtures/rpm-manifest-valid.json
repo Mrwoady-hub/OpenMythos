@@ -47,9 +47,39 @@
         {
           "group": "root",
           "mode": "0644",
-          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/vmlinuz",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.builtin.alias.bin",
           "private_key_marker": false,
           "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.builtin.bin",
+          "private_key_marker": false,
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.builtin.modinfo",
+          "private_key_marker": false,
+          "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/vmlinuz",
+          "private_key_marker": false,
+          "sha256": "abababababababababababababababababababababababababababababababab",
           "size": 7,
           "type": "file",
           "user": "root"
@@ -77,6 +107,106 @@
           "type": "file",
           "user": "root",
           "vermagic": "6.18.48-1.openmythos.fc44.x86_64 SMP preempt mod_unload"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.alias",
+          "private_key_marker": false,
+          "sha256": "0101010101010101010101010101010101010101010101010101010101010101",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.alias.bin",
+          "private_key_marker": false,
+          "sha256": "0202020202020202020202020202020202020202020202020202020202020202",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.dep",
+          "private_key_marker": false,
+          "sha256": "0303030303030303030303030303030303030303030303030303030303030303",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.dep.bin",
+          "private_key_marker": false,
+          "sha256": "0404040404040404040404040404040404040404040404040404040404040404",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.devname",
+          "private_key_marker": false,
+          "sha256": "0505050505050505050505050505050505050505050505050505050505050505",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.order",
+          "private_key_marker": false,
+          "sha256": "0606060606060606060606060606060606060606060606060606060606060606",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.softdep",
+          "private_key_marker": false,
+          "sha256": "0707070707070707070707070707070707070707070707070707070707070707",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.symbols",
+          "private_key_marker": false,
+          "sha256": "0808080808080808080808080808080808080808080808080808080808080808",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.symbols.bin",
+          "private_key_marker": false,
+          "sha256": "0909090909090909090909090909090909090909090909090909090909090909",
+          "size": 7,
+          "type": "file",
+          "user": "root"
+        },
+        {
+          "group": "root",
+          "mode": "0644",
+          "path": "/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/modules.weakdep",
+          "private_key_marker": false,
+          "sha256": "1010101010101010101010101010101010101010101010101010101010101010",
+          "size": 7,
+          "type": "file",
+          "user": "root"
         }
       ],
       "name": "kernel-openmythos-modules",
