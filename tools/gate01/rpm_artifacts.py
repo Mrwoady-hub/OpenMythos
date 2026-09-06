@@ -8,8 +8,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import runpy
 import stat
 import subprocess
+import sys
+import sysconfig
 import tempfile
 from typing import Any, Sequence
 
@@ -64,6 +67,28 @@ PRIVATE_KEY_SUFFIXES = (".key", ".p12", ".pfx", ".pk8", ".pkey", ".priv", ".priv
 PRIVATE_KEY_MARKER = b"PRIVATE KEY"
 MODULE_SIGNATURE_MARKER = b"~Module signature appended~\n"
 MODULE_SIGNATURE_HEADER_SIZE = 12
+FROZEN_HELPER_PATHS = (
+    "tools/__init__.py",
+    "tools/gate01/__init__.py",
+    "tools/gate01/inputs.py",
+    "tools/gate01/kernel_config.py",
+    "tools/gate01/module_key.py",
+    "tools/gate01/rpm_artifacts.py",
+    "tools/gate01/toolchain.py",
+)
+PROOF_SOURCE_PATHS = (
+    "scripts/gate01/build-kernel.sh",
+    "os/kernel/packaging/kernel-openmythos.spec",
+    *FROZEN_HELPER_PATHS,
+)
+BOOTSTRAP_MODULES = frozenset(
+    {
+        "tools.gate01.kernel_config",
+        "tools.gate01.module_key",
+        "tools.gate01.rpm_artifacts",
+        "tools.gate01.toolchain",
+    }
+)
 FIELD_SEPARATOR = "\x1f"
 RECORD_SEPARATOR = "\x1e"
 
@@ -108,6 +133,8 @@ ISOLATION_PLAN_FIELDS = {
     "output",
     "build_store",
     "inspection_store",
+    "private_key_source",
+    "public_certificate_source",
     "signing_environment",
     "probe_mounts",
     "build_mounts",
@@ -317,11 +344,16 @@ def _validate_package(
         raise ValueError("kernel-openmythos meta package must own no files")
     if package["name"] == "kernel-openmythos-core":
         if set(paths) != REQUIRED_CORE_PATHS or any(
-            record["type"] != "file" for record in files
+            record["type"] != "file" or record["size"] <= 0 for record in files
         ):
-            raise ValueError("kernel-openmythos core payload is not exact")
+            raise ValueError(
+                "kernel-openmythos core payload must be an exact nonempty regular file set"
+            )
     if package["name"] == "kernel-openmythos-modules":
         metadata_paths = {path for path in paths if path in REQUIRED_MODULE_METADATA_PATHS}
+        metadata_records = [
+            record for record in files if record.get("path") in REQUIRED_MODULE_METADATA_PATHS
+        ]
         module_records = [
             record
             for record in files
@@ -333,10 +365,19 @@ def _validate_package(
         }
         if metadata_paths != REQUIRED_MODULE_METADATA_PATHS or set(paths) != allowed_paths:
             raise ValueError("kernel-openmythos modules metadata/payload is not exact")
+        if any(
+            record["type"] != "file" or record["size"] <= 0
+            for record in metadata_records
+        ):
+            raise ValueError(
+                "kernel-openmythos modules metadata must be nonempty regular files"
+            )
         if not module_records:
             raise ValueError("kernel-openmythos requires a non-empty module set")
         if any(
-            record["type"] != "file" or not record["path"].startswith(module_root)
+            record["type"] != "file"
+            or record["size"] <= 0
+            or not record["path"].startswith(module_root)
             for record in module_records
         ):
             raise ValueError("kernel-openmythos module payload is invalid")
@@ -381,10 +422,16 @@ def validate_rpm_manifest(manifest: dict[str, Any]) -> None:
 def _absolute_plan_path(value: Any, description: str) -> PurePosixPath:
     if not isinstance(value, str) or not value.startswith("/"):
         raise ValueError(f"{description} must be an absolute path")
+    if ":" in value or "\0" in value:
+        raise ValueError(f"{description} cannot be encoded as a volume path")
     path = PurePosixPath(value)
     if "." in path.parts or ".." in path.parts or path.as_posix() != value:
         raise ValueError(f"{description} must be normalized")
     return path
+
+
+def _paths_overlap(left: PurePosixPath, right: PurePosixPath) -> bool:
+    return left == right or left in right.parents or right in left.parents
 
 
 def validate_builder_isolation_plan(plan: dict[str, Any]) -> None:
@@ -398,11 +445,17 @@ def validate_builder_isolation_plan(plan: dict[str, Any]) -> None:
     inspection_store = _absolute_plan_path(
         plan["inspection_store"], "inspection store"
     )
-    if build_store == inspection_store:
-        raise ValueError("build and inspection stores must be distinct")
+    private_key = _absolute_plan_path(plan["private_key_source"], "private key")
+    public_certificate = _absolute_plan_path(
+        plan["public_certificate_source"], "public certificate"
+    )
+    if _paths_overlap(private_key, public_certificate):
+        raise ValueError("private key and public certificate must be distinct")
+    if _paths_overlap(build_store, inspection_store):
+        raise ValueError("build and inspection stores must not overlap")
     for store in (build_store, inspection_store):
-        if store == output or output in store.parents:
-            raise ValueError("Podman store must be outside builder output")
+        if _paths_overlap(store, output):
+            raise ValueError("Podman store and builder output must not overlap")
 
     signing = plan["signing_environment"]
     if not isinstance(signing, dict):
@@ -429,10 +482,14 @@ def validate_builder_isolation_plan(plan: dict[str, Any]) -> None:
             if target in targets:
                 raise ValueError(f"{role} mount targets must be unique")
             targets.add(target)
-            if source == repository or target == PurePosixPath("/repo"):
+            if (
+                source == repository
+                or source in repository.parents
+                or target == PurePosixPath("/repo")
+            ):
                 raise ValueError(f"recursive repository mount is forbidden for {role}")
             for store in (build_store, inspection_store):
-                if source == store or source in store.parents:
+                if _paths_overlap(source, store):
                     raise ValueError(f"Podman store would be visible to {role}")
             mounts.append((source, target, raw_mount["read_only"]))
         parsed_mounts[role] = mounts
@@ -441,20 +498,47 @@ def validate_builder_isolation_plan(plan: dict[str, Any]) -> None:
     public_target = PurePosixPath("/public/module-signing.pem")
     if parsed_mounts["probe"]:
         raise ValueError("probe must have no host mounts")
-    build_key_mounts = [mount for mount in parsed_mounts["build"] if mount[1] == private_target]
-    if len(build_key_mounts) != 1 or not build_key_mounts[0][2]:
-        raise ValueError("build must receive one read-only private-key mount")
-    for role in ("probe", "inspection"):
-        if any(
-            target == private_target or source.name.endswith(PRIVATE_KEY_SUFFIXES)
-            for source, target, _ in parsed_mounts[role]
-        ):
-            raise ValueError(f"{role} must not receive the private key")
+    build_key_mounts = [
+        mount for mount in parsed_mounts["build"] if mount[1] == private_target
+    ]
+    if build_key_mounts != [(private_key, private_target, True)]:
+        raise ValueError("build must receive the exact private key read-only")
     inspection_public_mounts = [
         mount for mount in parsed_mounts["inspection"] if mount[1] == public_target
     ]
-    if len(inspection_public_mounts) != 1 or not inspection_public_mounts[0][2]:
-        raise ValueError("inspection must receive one read-only public certificate")
+    if inspection_public_mounts != [(public_certificate, public_target, True)]:
+        raise ValueError("inspection must receive the exact public certificate read-only")
+
+    allowed_private_mount = ("build", private_key, private_target, True)
+    allowed_public_mount = (
+        "inspection",
+        public_certificate,
+        public_target,
+        True,
+    )
+    for role, mounts in parsed_mounts.items():
+        for source, target, read_only in mounts:
+            candidate = (role, source, target, read_only)
+            if _paths_overlap(source, private_key) and candidate != allowed_private_mount:
+                raise ValueError(f"{role} must not receive private-key material")
+            if (
+                _paths_overlap(source, public_certificate)
+                and candidate != allowed_public_mount
+            ):
+                raise ValueError(f"{role} has an excess public-certificate mount")
+            if source.name.lower().endswith(PRIVATE_KEY_SUFFIXES) and (
+                candidate != allowed_private_mount
+            ):
+                raise ValueError(f"{role} has an excess secret-like mount")
+
+
+def _isolation_volume_specs(plan: dict[str, Any], role: str) -> list[str]:
+    """Return the canonical Podman volume arguments represented by one plan."""
+    return [
+        f"{mount['source']}:{mount['target']}:"
+        f"{'ro' if mount['read_only'] else 'rw'}"
+        for mount in plan[f"{role}_mounts"]
+    ]
 
 
 def validate_imported_image_identity(
@@ -481,6 +565,190 @@ def validate_imported_image_identity(
         or observed_manifest_digest != expected_manifest_digest
     ):
         raise ValueError("imported image identity does not match both locked digests")
+
+
+def isolated_runtime_record(expected_root: Path) -> dict[str, Any]:
+    """Describe and validate the frozen interpreter boundary used by proof code."""
+    expected_root = _absolute_lexical_path(expected_root)
+    root_status = expected_root.lstat()
+    if expected_root.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
+        raise ValueError("frozen helper root must be a non-symlink directory")
+    root = expected_root.resolve(strict=True)
+    module_file = Path(__file__).resolve(strict=True)
+    flags = {
+        "dont_write_bytecode": sys.flags.dont_write_bytecode,
+        "ignore_environment": sys.flags.ignore_environment,
+        "isolated": sys.flags.isolated,
+        "no_site": sys.flags.no_site,
+        "no_user_site": sys.flags.no_user_site,
+        "safe_path": sys.flags.safe_path,
+    }
+    expected_flags = {
+        "dont_write_bytecode": 1,
+        "ignore_environment": 1,
+        "isolated": 1,
+        "no_site": 1,
+        "no_user_site": 1,
+        "safe_path": True,
+    }
+    if flags != expected_flags:
+        raise ValueError("Python proof runtime is not fully isolated")
+    if module_file != root / "tools/gate01/rpm_artifacts.py":
+        raise ValueError("Python proof runtime did not load the frozen verifier")
+    normalized_path = [os.fspath(Path(entry).resolve()) for entry in sys.path]
+    if not normalized_path or normalized_path[0] != os.fspath(root):
+        raise ValueError("frozen helper root is not the sole explicit import root")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "flags": flags,
+        "frozen_root": os.fspath(root),
+        "module_file": os.fspath(module_file),
+        "sys_path": normalized_path,
+    }
+
+
+def bootstrap_frozen_module(root: Path, python_arguments: list[str]) -> int:
+    """Run one allowlisted frozen module under an already isolated interpreter."""
+    root = _absolute_lexical_path(root)
+    root_status = root.lstat()
+    if root.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
+        raise ValueError("bootstrap root must be a non-symlink directory")
+    frozen_root = root.resolve(strict=True)
+    if Path(__file__).resolve(strict=True) != (
+        frozen_root / "tools/gate01/rpm_artifacts.py"
+    ):
+        raise ValueError("bootstrap verifier is not inside the declared frozen root")
+    expected_flags = (
+        sys.flags.isolated,
+        sys.flags.ignore_environment,
+        sys.flags.no_user_site,
+        sys.flags.no_site,
+        sys.flags.safe_path,
+        sys.flags.dont_write_bytecode,
+    )
+    if expected_flags != (1, 1, 1, 1, True, 1):
+        raise ValueError("frozen Python bootstrap requires -I -S -B")
+    arguments = list(python_arguments)
+    if arguments and arguments[0] == "--":
+        arguments.pop(0)
+    if len(arguments) < 2 or arguments[0] != "-m":
+        raise ValueError("frozen Python bootstrap accepts only an allowlisted -m module")
+    module = arguments[1]
+    if module not in BOOTSTRAP_MODULES:
+        raise ValueError(f"Python proof module is not allowlisted: {module}")
+    stdlib_roots = {
+        Path(sysconfig.get_path(name)).resolve()
+        for name in ("stdlib", "platstdlib")
+    }
+    isolated_stdlib: list[str] = []
+    for raw_entry in tuple(sys.path):
+        if not raw_entry:
+            raise ValueError("isolated Python path contains the current directory")
+        entry = Path(raw_entry).resolve()
+        is_stdlib = any(entry == root or root in entry.parents for root in stdlib_roots)
+        is_stdlib_zip = any(
+            entry.parent == root.parent
+            and entry.name.startswith("python")
+            and entry.suffix == ".zip"
+            for root in stdlib_roots
+        )
+        if not (is_stdlib or is_stdlib_zip):
+            raise ValueError(f"isolated Python path has an undeclared entry: {entry}")
+        isolated_stdlib.append(os.fspath(entry))
+    # Replace, rather than extend, the import path.  -I/-S made the retained
+    # entries interpreter-owned stdlib paths; the one explicit root is frozen.
+    sys.path[:] = [os.fspath(frozen_root), *isolated_stdlib]
+    sys.argv = [module, *arguments[2:]]
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+    return 0
+
+
+def validate_frozen_helper_tree(source_root: Path, snapshot_root: Path) -> None:
+    """Validate the exact read-only local-Python closure and its live identity."""
+    expected_files = set(FROZEN_HELPER_PATHS)
+    expected_directories = {"tools", "tools/gate01"}
+    try:
+        snapshot_status = snapshot_root.lstat()
+    except OSError as error:
+        raise ValueError("frozen helper snapshot is missing") from error
+    if (
+        not stat.S_ISDIR(snapshot_status.st_mode)
+        or snapshot_root.is_symlink()
+        or stat.S_IMODE(snapshot_status.st_mode) != 0o555
+    ):
+        raise ValueError("frozen helper snapshot root must be a 0555 directory")
+
+    observed_files: set[str] = set()
+    observed_directories: set[str] = set()
+    for path in snapshot_root.rglob("*"):
+        relative = path.relative_to(snapshot_root).as_posix()
+        status = path.lstat()
+        if stat.S_ISDIR(status.st_mode):
+            if path.is_symlink() or stat.S_IMODE(status.st_mode) != 0o555:
+                raise ValueError(f"frozen helper directory is unsafe: {relative}")
+            observed_directories.add(relative)
+        elif stat.S_ISREG(status.st_mode):
+            if status.st_nlink != 1 or stat.S_IMODE(status.st_mode) != 0o444:
+                raise ValueError(f"frozen helper file is unsafe: {relative}")
+            observed_files.add(relative)
+        else:
+            raise ValueError(f"frozen helper tree contains a special entry: {relative}")
+    if observed_files != expected_files or observed_directories != expected_directories:
+        raise ValueError("frozen helper tree is not the exact import closure")
+
+    for relative in FROZEN_HELPER_PATHS:
+        source = source_root / relative
+        frozen = snapshot_root / relative
+        try:
+            source_before = source.lstat()
+            frozen_before = frozen.lstat()
+        except OSError as error:
+            raise ValueError(f"frozen helper is missing: {relative}") from error
+        if (
+            not stat.S_ISREG(source_before.st_mode)
+            or source.is_symlink()
+            or not stat.S_ISREG(frozen_before.st_mode)
+            or frozen.is_symlink()
+        ):
+            raise ValueError(f"frozen helper must be a regular non-symlink: {relative}")
+        source_digest = _sha256_file(source)
+        frozen_digest = _sha256_file(frozen)
+        source_after = source.lstat()
+        frozen_after = frozen.lstat()
+        source_identity_before = (
+            source_before.st_dev,
+            source_before.st_ino,
+            source_before.st_size,
+            source_before.st_mtime_ns,
+            source_before.st_ctime_ns,
+        )
+        source_identity_after = (
+            source_after.st_dev,
+            source_after.st_ino,
+            source_after.st_size,
+            source_after.st_mtime_ns,
+            source_after.st_ctime_ns,
+        )
+        frozen_identity_before = (
+            frozen_before.st_dev,
+            frozen_before.st_ino,
+            frozen_before.st_size,
+            frozen_before.st_mtime_ns,
+            frozen_before.st_ctime_ns,
+        )
+        frozen_identity_after = (
+            frozen_after.st_dev,
+            frozen_after.st_ino,
+            frozen_after.st_size,
+            frozen_after.st_mtime_ns,
+            frozen_after.st_ctime_ns,
+        )
+        if (
+            source_identity_before != source_identity_after
+            or frozen_identity_before != frozen_identity_after
+            or source_digest != frozen_digest
+        ):
+            raise ValueError(f"frozen helper identity differs from source: {relative}")
 
 
 def _installed_file_view(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -563,9 +831,518 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _status_identity(status: os.stat_result) -> tuple[int, ...]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mode,
+        status.st_nlink,
+        status.st_uid,
+        status.st_gid,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    """Make a path absolute without following a final symlink."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _open_bound_directory(
+    directory: Path, description: str, *, expected_mode: int | None = None
+) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(directory, flags)
+        opened = os.fstat(descriptor)
+        path_status = directory.lstat()
+    except OSError as error:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise ValueError(f"{description} is missing or unsafe: {directory}") from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(path_status.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (path_status.st_dev, path_status.st_ino)
+        or (
+            expected_mode is not None
+            and stat.S_IMODE(opened.st_mode) != expected_mode
+        )
+    ):
+        os.close(descriptor)
+        raise ValueError(f"{description} is not stable: {directory}")
+    return {
+        "descriptor": descriptor,
+        "path": directory,
+        "before": opened,
+        "names": sorted(os.listdir(descriptor)),
+        "description": description,
+    }
+
+
+def _verify_bound_directory(record: dict[str, Any]) -> None:
+    descriptor = record["descriptor"]
+    directory = record["path"]
+    try:
+        after = os.fstat(descriptor)
+        path_after = directory.lstat()
+    except OSError as error:
+        raise ValueError(f"{record['description']} changed: {directory}") from error
+    if (
+        sorted(os.listdir(descriptor)) != record["names"]
+        or _status_identity(record["before"]) != _status_identity(after)
+        or (after.st_dev, after.st_ino)
+        != (path_after.st_dev, path_after.st_ino)
+        or stat.S_ISLNK(path_after.st_mode)
+    ):
+        raise ValueError(f"{record['description']} changed: {directory}")
+
+
+def _open_bound_regular(
+    path: Path,
+    description: str,
+    *,
+    directory_descriptor: int | None = None,
+    name: str | None = None,
+    expected_mode: int | None = None,
+) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        if directory_descriptor is None:
+            descriptor = os.open(path, flags)
+            path_status = path.lstat()
+        else:
+            if name is None:
+                raise ValueError("bound relative file requires a name")
+            descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+            path_status = os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise ValueError(f"{description} is missing or unsafe: {path}") from error
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or stat.S_ISLNK(path_status.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (path_status.st_dev, path_status.st_ino)
+        or (
+            expected_mode is not None
+            and stat.S_IMODE(opened.st_mode) != expected_mode
+        )
+    ):
+        os.close(descriptor)
+        raise ValueError(f"{description} must be one safe regular file: {path}")
+    return {
+        "descriptor": descriptor,
+        "path": path,
+        "before": opened,
+        "description": description,
+    }
+
+
+def _hash_bound_file(record: dict[str, Any]) -> str:
+    descriptor = record["descriptor"]
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_bound_file(record: dict[str, Any], maximum_bytes: int) -> bytes:
+    if record["before"].st_size > maximum_bytes:
+        raise ValueError(f"{record['description']} exceeds its size limit")
+    descriptor = record["descriptor"]
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = maximum_bytes + 1
+    while remaining and (chunk := os.read(descriptor, min(remaining, 1024 * 1024))):
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    value = b"".join(chunks)
+    if len(value) > maximum_bytes:
+        raise ValueError(f"{record['description']} exceeds its size limit")
+    return value
+
+
+def _verify_bound_file(record: dict[str, Any]) -> None:
+    try:
+        after = os.fstat(record["descriptor"])
+        path_after = record["path"].lstat()
+    except OSError as error:
+        raise ValueError(
+            f"{record['description']} changed: {record['path']}"
+        ) from error
+    if (
+        _status_identity(record["before"]) != _status_identity(after)
+        or not stat.S_ISREG(path_after.st_mode)
+        or after.st_nlink != 1
+        or (after.st_dev, after.st_ino)
+        != (path_after.st_dev, path_after.st_ino)
+    ):
+        raise ValueError(f"{record['description']} changed: {record['path']}")
+
+
+def _close_bound_records(records: list[dict[str, Any]]) -> None:
+    for record in reversed(records):
+        os.close(record["descriptor"])
+
+
+def _two_pass_hash_and_sweep(
+    files: list[dict[str, Any]], directories: list[dict[str, Any]]
+) -> list[str]:
+    first = [_hash_bound_file(record) for record in files]
+    second = [_hash_bound_file(record) for record in files]
+    if first != second:
+        raise ValueError("bound proof file bytes changed between hash passes")
+    for record in files:
+        _verify_bound_file(record)
+    for record in directories:
+        _verify_bound_directory(record)
+    return first
+
+
+def _open_retained_rpm_set(
+    rpm_dir: Path, srpm_dir: Path, manifest: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    validate_rpm_manifest(manifest)
+    if rpm_dir.name != "x86_64":
+        raise ValueError("retained RPM root must contain the exact x86_64 leaf")
+    source_expected = {
+        EXPECTED_SOURCE_FILENAME: manifest["source_rpms"][0]["sha256"]
+    }
+    binary_expected = {
+        f"{package['nevra']}.rpm": package["sha256"]
+        for package in manifest["binary_rpms"]
+    }
+    directories: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    expected: dict[str, str] = {}
+    try:
+        root_record = _open_bound_directory(rpm_dir.parent, "retained RPM root")
+        directories.append(root_record)
+        if root_record["names"] != ["x86_64"]:
+            raise ValueError("retained RPM root must contain only x86_64")
+        rpm_record = _open_bound_directory(rpm_dir, "retained RPM set")
+        directories.append(rpm_record)
+        leaf_status = os.stat(
+            "x86_64",
+            dir_fd=root_record["descriptor"],
+            follow_symlinks=False,
+        )
+        if (leaf_status.st_dev, leaf_status.st_ino) != (
+            rpm_record["before"].st_dev,
+            rpm_record["before"].st_ino,
+        ):
+            raise ValueError("retained RPM x86_64 directory is not stable")
+        srpm_record = _open_bound_directory(srpm_dir, "retained SRPM set")
+        directories.append(srpm_record)
+        source_names = sorted(source_expected)
+        binary_names = sorted(binary_expected)
+        if srpm_record["names"] != source_names:
+            raise ValueError(f"retained RPM set is not exact: {srpm_dir}")
+        if rpm_record["names"] != binary_names:
+            raise ValueError(f"retained RPM set is not exact: {rpm_dir}")
+        for directory_record, names, digests in (
+            (srpm_record, source_names, source_expected),
+            (rpm_record, binary_names, binary_expected),
+        ):
+            for name in names:
+                path = directory_record["path"] / name
+                file_record = _open_bound_regular(
+                    path,
+                    "retained RPM",
+                    directory_descriptor=directory_record["descriptor"],
+                    name=name,
+                )
+                file_record["kind"] = "rpm"
+                files.append(file_record)
+                expected[os.fspath(path)] = digests[name]
+    except BaseException:
+        _close_bound_records(files)
+        _close_bound_records(directories)
+        raise
+    return files, directories, expected
+
+
+def _retained_file_digest(directory_descriptor: int, name: str) -> str:
+    """Hash one exact retained regular entry without blocking on special files."""
+    path = Path(f"/proc/self/fd/{directory_descriptor}") / name
+    record = _open_bound_regular(
+        path,
+        "retained RPM",
+        directory_descriptor=directory_descriptor,
+        name=name,
+    )
+    try:
+        return _two_pass_hash_and_sweep([record], [])[0]
+    finally:
+        os.close(record["descriptor"])
+
+
+def validate_retained_rpm_set(
+    rpm_dir: Path, srpm_dir: Path, manifest: dict[str, Any]
+) -> None:
+    """Bind a two-pass, simultaneously open exact retained RPM topology."""
+    rpm_dir = _absolute_lexical_path(rpm_dir)
+    srpm_dir = _absolute_lexical_path(srpm_dir)
+    files: list[dict[str, Any]] = []
+    directories: list[dict[str, Any]] = []
+    try:
+        files, directories, expected = _open_retained_rpm_set(
+            rpm_dir, srpm_dir, manifest
+        )
+        digests = _two_pass_hash_and_sweep(files, directories)
+        for record, digest in zip(files, digests, strict=True):
+            if digest != expected[os.fspath(record["path"])]:
+                raise ValueError(
+                    f"retained RPM hash differs from inspected manifest: "
+                    f"{record['path'].name}"
+                )
+    finally:
+        _close_bound_records(files)
+        _close_bound_records(directories)
+
+
+def _parse_proof_source_manifest(value: bytes, description: str) -> dict[str, str]:
+    try:
+        text = value.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{description} is not ASCII") from error
+    if not text.endswith("\n") or "\r" in text:
+        raise ValueError(f"{description} is not canonical")
+    lines = text.splitlines()
+    if len(lines) != len(PROOF_SOURCE_PATHS):
+        raise ValueError(f"{description} does not contain the exact proof source set")
+    parsed: dict[str, str] = {}
+    for expected_path, line in zip(PROOF_SOURCE_PATHS, lines, strict=True):
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^\0\r\n]+)", line)
+        if match is None or match.group(2) != expected_path:
+            raise ValueError(f"{description} is not canonical")
+        parsed[expected_path] = match.group(1)
+    canonical = "".join(
+        f"{parsed[relative]}  {relative}\n" for relative in PROOF_SOURCE_PATHS
+    ).encode("ascii")
+    if canonical != value:
+        raise ValueError(f"{description} is not canonical")
+    return parsed
+
+
+def _parse_bound_rpm_manifest(value: bytes) -> dict[str, Any]:
+    try:
+        manifest = json.loads(
+            value.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("bound RPM manifest is invalid") from error
+    validate_rpm_manifest(manifest)
+    return manifest
+
+
+def _open_exact_frozen_tree(
+    snapshot_root: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Path]]:
+    directories: list[dict[str, Any]] = []
+    try:
+        directories.append(
+            _open_bound_directory(
+                snapshot_root, "frozen helper root", expected_mode=0o555
+            )
+        )
+        directories.append(
+            _open_bound_directory(
+                snapshot_root / "tools",
+                "frozen tools package",
+                expected_mode=0o555,
+            )
+        )
+        directories.append(
+            _open_bound_directory(
+                snapshot_root / "tools/gate01",
+                "frozen Gate 01 package",
+                expected_mode=0o555,
+            )
+        )
+        expected_names = (
+            ["tools"],
+            ["__init__.py", "gate01"],
+            sorted(Path(relative).name for relative in FROZEN_HELPER_PATHS[1:]),
+        )
+        for record, names in zip(directories, expected_names, strict=True):
+            if record["names"] != names:
+                raise ValueError("frozen helper tree is not the exact import closure")
+        return directories, {
+            relative: snapshot_root / relative for relative in FROZEN_HELPER_PATHS
+        }
+    except BaseException:
+        _close_bound_records(directories)
+        raise
+
+
+def validate_final_proof_boundary(
+    *,
+    rpm_dir: Path,
+    srpm_dir: Path,
+    rpm_manifest_path: Path,
+    expected_rpm_manifest_sha256: str,
+    source_root: Path,
+    snapshot_root: Path,
+    spec_snapshot: Path,
+    driver_snapshot: Path,
+    expected_source_manifest: Path,
+    final_source_manifest: Path,
+) -> None:
+    """Bind proof sources, frozen copies, manifests, and RPMs in one interval.
+
+    Every proof-relevant file descriptor remains open across two complete hash
+    passes and one final global identity/path/topology sweep.  This establishes
+    one mutually consistent observation interval; a caller that needs to resist
+    a hostile same-UID writer after return must publish on an immutable medium.
+    """
+    if not RAW_SHA256_RE.fullmatch(expected_rpm_manifest_sha256):
+        raise ValueError("inspected RPM manifest SHA-256 is malformed")
+    source_root = _absolute_lexical_path(source_root)
+    snapshot_root = _absolute_lexical_path(snapshot_root)
+    rpm_dir = _absolute_lexical_path(rpm_dir)
+    srpm_dir = _absolute_lexical_path(srpm_dir)
+    files: list[dict[str, Any]] = []
+    directories: list[dict[str, Any]] = []
+    try:
+        early_record = _open_bound_regular(
+            _absolute_lexical_path(expected_source_manifest),
+            "early proof source manifest",
+        )
+        early_record["kind"] = "source-manifest"
+        files.append(early_record)
+        final_record = _open_bound_regular(
+            _absolute_lexical_path(final_source_manifest),
+            "final proof source manifest",
+        )
+        final_record["kind"] = "source-manifest"
+        files.append(final_record)
+        rpm_manifest_record = _open_bound_regular(
+            _absolute_lexical_path(rpm_manifest_path), "RPM artifact manifest"
+        )
+        rpm_manifest_record["kind"] = "rpm-manifest"
+        files.append(rpm_manifest_record)
+
+        early_bytes = _read_bound_file(early_record, 64 * 1024)
+        final_bytes = _read_bound_file(final_record, 64 * 1024)
+        rpm_manifest_bytes = _read_bound_file(rpm_manifest_record, 64 * 1024 * 1024)
+        early_hashes = _parse_proof_source_manifest(
+            early_bytes, "early proof source manifest"
+        )
+        final_hashes = _parse_proof_source_manifest(
+            final_bytes, "final proof source manifest"
+        )
+        if early_bytes != final_bytes or early_hashes != final_hashes:
+            raise ValueError("proof source manifests differ")
+        rpm_manifest = _parse_bound_rpm_manifest(rpm_manifest_bytes)
+
+        frozen_directories, frozen_paths = _open_exact_frozen_tree(snapshot_root)
+        directories.extend(frozen_directories)
+        live_records: dict[str, dict[str, Any]] = {}
+        snapshot_records: dict[str, dict[str, Any]] = {}
+        for relative in PROOF_SOURCE_PATHS:
+            live_record = _open_bound_regular(
+                source_root / relative, f"live proof source {relative}"
+            )
+            live_record["kind"] = "proof-source"
+            live_record["relative"] = relative
+            files.append(live_record)
+            live_records[relative] = live_record
+
+            if relative == "scripts/gate01/build-kernel.sh":
+                snapshot_path = _absolute_lexical_path(driver_snapshot)
+                expected_mode = 0o555
+            elif relative == "os/kernel/packaging/kernel-openmythos.spec":
+                snapshot_path = _absolute_lexical_path(spec_snapshot)
+                expected_mode = 0o444
+            else:
+                snapshot_path = frozen_paths[relative]
+                expected_mode = 0o444
+            snapshot_record = _open_bound_regular(
+                snapshot_path,
+                f"frozen proof source {relative}",
+                expected_mode=expected_mode,
+            )
+            snapshot_record["kind"] = "proof-snapshot"
+            snapshot_record["relative"] = relative
+            files.append(snapshot_record)
+            snapshot_records[relative] = snapshot_record
+
+        rpm_files, rpm_directories, rpm_expected = _open_retained_rpm_set(
+            rpm_dir, srpm_dir, rpm_manifest
+        )
+        files.extend(rpm_files)
+        directories.extend(rpm_directories)
+
+        digests = _two_pass_hash_and_sweep(files, directories)
+        digest_by_descriptor = {
+            record["descriptor"]: digest
+            for record, digest in zip(files, digests, strict=True)
+        }
+        initial_bytes = {
+            early_record["descriptor"]: early_bytes,
+            final_record["descriptor"]: final_bytes,
+            rpm_manifest_record["descriptor"]: rpm_manifest_bytes,
+        }
+        for descriptor, value in initial_bytes.items():
+            if hashlib.sha256(value).hexdigest() != digest_by_descriptor[descriptor]:
+                raise ValueError("bound proof manifest changed after it was parsed")
+        if (
+            digest_by_descriptor[rpm_manifest_record["descriptor"]]
+            != expected_rpm_manifest_sha256
+        ):
+            raise ValueError("RPM manifest differs from its inspected identity")
+
+        for relative in PROOF_SOURCE_PATHS:
+            live_digest = digest_by_descriptor[live_records[relative]["descriptor"]]
+            snapshot_digest = digest_by_descriptor[
+                snapshot_records[relative]["descriptor"]
+            ]
+            if (
+                live_digest != early_hashes[relative]
+                or live_digest != snapshot_digest
+            ):
+                raise ValueError(f"proof source changed or differs: {relative}")
+        for record in rpm_files:
+            digest = digest_by_descriptor[record["descriptor"]]
+            if digest != rpm_expected[os.fspath(record["path"])]:
+                raise ValueError(
+                    "retained RPM hash differs from inspected manifest: "
+                    f"{record['path'].name}"
+                )
+    finally:
+        _close_bound_records(files)
+        _close_bound_records(directories)
+
+
 def _snapshot_rpm(source: Path, destination: Path) -> str:
     """Copy one stable, non-symlink RPM identity for every later operation."""
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         source_descriptor = os.open(source, flags)
     except OSError as error:
@@ -850,6 +1627,29 @@ def _validate_pre_extraction_paths(
         raise ValueError(f"RPM path listing/header mismatch for {rpm_path}")
     if len(header_paths) != len(set(header_paths)):
         raise ValueError(f"duplicate RPM payload path in {rpm_path}")
+
+    module_root = RELEASE_ROOT / "kernel"
+    expected_directories: set[PurePosixPath] = set()
+    for header, header_path in zip(headers, normalized_header_paths, strict=True):
+        if (
+            stat.S_IFMT(header["raw_mode"]) == stat.S_IFREG
+            and header_path.as_posix().endswith(".ko")
+            and (header_path.parent == module_root or module_root in header_path.parents)
+        ):
+            parent = header_path.parent
+            while parent == module_root or module_root in parent.parents:
+                expected_directories.add(parent)
+                if parent == module_root:
+                    break
+                parent = parent.parent
+    explicit_directories = {
+        header_path
+        for header, header_path in zip(headers, normalized_header_paths, strict=True)
+        if stat.S_IFMT(header["raw_mode"]) == stat.S_IFDIR
+    }
+    if explicit_directories != expected_directories:
+        raise ValueError(f"RPM explicit directory topology is not exact for {rpm_path}")
+
     for header_path in normalized_header_paths:
         if any(symlink in header_path.parents for symlink in symlink_paths):
             raise ValueError(
@@ -1021,21 +1821,71 @@ def _extract_validated_cpio(spool: Path, destination: Path) -> None:
         raise RuntimeError(f"cpio failed for validated spool {spool}: {message}")
 
 
-def _extracted_non_directories(root: Path) -> set[str]:
-    paths: set[str] = set()
-    for current, directory_names, filenames in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        retained_directories: list[str] = []
-        for name in directory_names:
-            candidate = current_path / name
-            if candidate.is_symlink():
-                paths.add("/" + candidate.relative_to(root).as_posix())
-            else:
-                retained_directories.append(name)
-        directory_names[:] = retained_directories
-        for name in filenames:
-            paths.add("/" + (current_path / name).relative_to(root).as_posix())
-    return paths
+def _validate_extracted_tree(root: Path, headers: list[dict[str, Any]]) -> None:
+    """Require exact extracted entries/types, including all implicit directories."""
+    expected_types: dict[str, int] = {}
+    header_modes: dict[str, int] = {}
+    for header in headers:
+        path = PurePosixPath(header["path"])
+        expected_types[path.as_posix()] = stat.S_IFMT(header["raw_mode"])
+        header_modes[path.as_posix()] = stat.S_IMODE(header["raw_mode"])
+        for parent in path.parents:
+            if parent == PurePosixPath("/"):
+                break
+            expected_types.setdefault(parent.as_posix(), stat.S_IFDIR)
+
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_descriptor = os.open(root, flags)
+    except OSError as error:
+        raise ValueError("extracted RPM tree root is missing or unsafe") from error
+    observed: dict[str, tuple[int, int]] = {}
+
+    def walk(directory_descriptor: int, relative: PurePosixPath) -> None:
+        names_before = sorted(os.listdir(directory_descriptor))
+        for name in names_before:
+            if name in ("", ".", "..") or "/" in name:
+                raise ValueError("extracted RPM tree contains an unsafe name")
+            status = os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            path = relative / name
+            absolute = (PurePosixPath("/") / path).as_posix()
+            file_type = stat.S_IFMT(status.st_mode)
+            observed[absolute] = (file_type, stat.S_IMODE(status.st_mode))
+            if file_type == stat.S_IFDIR:
+                child = os.open(name, flags, dir_fd=directory_descriptor)
+                try:
+                    child_status = os.fstat(child)
+                    if (status.st_dev, status.st_ino) != (
+                        child_status.st_dev,
+                        child_status.st_ino,
+                    ):
+                        raise ValueError("extracted RPM tree changed while walking")
+                    walk(child, path)
+                finally:
+                    os.close(child)
+        if sorted(os.listdir(directory_descriptor)) != names_before:
+            raise ValueError("extracted RPM tree changed while walking")
+
+    try:
+        walk(root_descriptor, PurePosixPath())
+    finally:
+        os.close(root_descriptor)
+
+    if set(observed) != set(expected_types):
+        raise ValueError("extracted RPM tree does not exactly match payload and ancestors")
+    for path, expected_type in expected_types.items():
+        observed_type, observed_mode = observed[path]
+        if observed_type != expected_type:
+            raise ValueError(f"extracted RPM tree type mismatch: {path}")
+        if path in header_modes and observed_mode != header_modes[path]:
+            raise ValueError(f"extracted RPM tree mode mismatch: {path}")
 
 
 def _validate_modules_order(extract_root: Path, headers: list[dict[str, Any]]) -> None:
@@ -1170,14 +2020,7 @@ def inspect_rpm_set(
                 raise ValueError(f"binary RPM snapshot identity changed: {original}")
             package_extract_root = extract_root / package["name"]
             _extract_validated_cpio(cpio_spool, package_extract_root)
-            expected_non_directories = {
-                header["path"]
-                for header in headers
-                if stat.S_IFMT(header["raw_mode"]) != stat.S_IFDIR
-            }
-            observed_non_directories = _extracted_non_directories(package_extract_root)
-            if expected_non_directories != observed_non_directories:
-                raise ValueError(f"extracted RPM payload differs from header: {original}")
+            _validate_extracted_tree(package_extract_root, headers)
             if package["name"] == "kernel-openmythos-modules":
                 _validate_modules_order(package_extract_root, headers)
             records = [
@@ -1200,6 +2043,7 @@ def inspect_rpm_set(
         "binary_rpms": sorted(binaries, key=lambda package: package["name"]),
     }
     validate_rpm_manifest(manifest)
+    validate_retained_rpm_set(rpm_dir, srpm_dir, manifest)
     installed_files = {
         "schema_version": SCHEMA_VERSION,
         "kernel_release": KERNEL_RELEASE,
@@ -1211,15 +2055,15 @@ def inspect_rpm_set(
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    serialized = _canonical_json_bytes(value)
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o644)
@@ -1229,19 +2073,50 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
+def _canonical_json_bytes(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def _inspect_command(arguments: argparse.Namespace) -> int:
-    inspect_rpm_set(
+    manifest = inspect_rpm_set(
         arguments.rpm_dir,
         arguments.srpm_dir,
         arguments.output,
         arguments.extract_root,
         arguments.public_certificate,
     )
+    if arguments.print_manifest_sha256:
+        print(hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest())
     return 0
 
 
 def _validate_command(arguments: argparse.Namespace) -> int:
     validate_rpm_manifest(load_rpm_manifest(arguments.manifest))
+    return 0
+
+
+def _rebind_command(arguments: argparse.Namespace) -> int:
+    validate_retained_rpm_set(
+        arguments.rpm_dir,
+        arguments.srpm_dir,
+        load_rpm_manifest(arguments.manifest),
+    )
+    return 0
+
+
+def _bind_final_command(arguments: argparse.Namespace) -> int:
+    validate_final_proof_boundary(
+        rpm_dir=arguments.rpm_dir,
+        srpm_dir=arguments.srpm_dir,
+        rpm_manifest_path=arguments.rpm_manifest,
+        expected_rpm_manifest_sha256=arguments.expected_rpm_manifest_sha256,
+        source_root=arguments.source_root,
+        snapshot_root=arguments.snapshot_root,
+        spec_snapshot=arguments.spec_snapshot,
+        driver_snapshot=arguments.driver_snapshot,
+        expected_source_manifest=arguments.expected_source_manifest,
+        final_source_manifest=arguments.final_source_manifest,
+    )
     return 0
 
 
@@ -1259,6 +2134,12 @@ def _audit_isolation_command(arguments: argparse.Namespace) -> int:
         object_pairs_hook=_reject_duplicate_pairs,
     )
     validate_builder_isolation_plan(value)
+    if arguments.build_volume != _isolation_volume_specs(value, "build"):
+        raise ValueError("audited build mounts differ from actual volume arguments")
+    if arguments.inspection_volume != _isolation_volume_specs(value, "inspection"):
+        raise ValueError(
+            "audited inspection mounts differ from actual volume arguments"
+        )
     return 0
 
 
@@ -1272,6 +2153,29 @@ def _audit_image_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _audit_freeze_command(arguments: argparse.Namespace) -> int:
+    validate_frozen_helper_tree(arguments.source_root, arguments.snapshot_root)
+    return 0
+
+
+def _audit_runtime_command(arguments: argparse.Namespace) -> int:
+    _atomic_write_json(
+        arguments.output, isolated_runtime_record(arguments.expected_root)
+    )
+    return 0
+
+
+def _audit_source_lock_command(arguments: argparse.Namespace) -> int:
+    from tools.gate01.inputs import load_source_lock, validate_source_lock
+
+    validate_source_lock(load_source_lock(arguments.source_lock))
+    return 0
+
+
+def _bootstrap_command(arguments: argparse.Namespace) -> int:
+    return bootstrap_frozen_module(arguments.root, arguments.python_arguments)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1282,11 +2186,33 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--output", required=True, type=Path)
     inspect_parser.add_argument("--extract-root", required=True, type=Path)
     inspect_parser.add_argument("--public-certificate", required=True, type=Path)
+    inspect_parser.add_argument("--print-manifest-sha256", action="store_true")
     inspect_parser.set_defaults(handler=_inspect_command)
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("manifest", type=Path)
     validate_parser.set_defaults(handler=_validate_command)
+
+    rebind_parser = subparsers.add_parser("rebind")
+    rebind_parser.add_argument("--rpm-dir", required=True, type=Path)
+    rebind_parser.add_argument("--srpm-dir", required=True, type=Path)
+    rebind_parser.add_argument("--manifest", required=True, type=Path)
+    rebind_parser.set_defaults(handler=_rebind_command)
+
+    bind_final_parser = subparsers.add_parser("bind-final")
+    bind_final_parser.add_argument("--rpm-dir", required=True, type=Path)
+    bind_final_parser.add_argument("--srpm-dir", required=True, type=Path)
+    bind_final_parser.add_argument("--rpm-manifest", required=True, type=Path)
+    bind_final_parser.add_argument("--expected-rpm-manifest-sha256", required=True)
+    bind_final_parser.add_argument("--source-root", required=True, type=Path)
+    bind_final_parser.add_argument("--snapshot-root", required=True, type=Path)
+    bind_final_parser.add_argument("--spec-snapshot", required=True, type=Path)
+    bind_final_parser.add_argument("--driver-snapshot", required=True, type=Path)
+    bind_final_parser.add_argument(
+        "--expected-source-manifest", required=True, type=Path
+    )
+    bind_final_parser.add_argument("--final-source-manifest", required=True, type=Path)
+    bind_final_parser.set_defaults(handler=_bind_final_command)
 
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("--left", required=True, type=Path)
@@ -1296,6 +2222,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     isolation_parser = subparsers.add_parser("audit-isolation")
     isolation_parser.add_argument("--plan", required=True, type=Path)
+    isolation_parser.add_argument("--build-volume", action="append", default=[])
+    isolation_parser.add_argument("--inspection-volume", action="append", default=[])
     isolation_parser.set_defaults(handler=_audit_isolation_command)
 
     image_parser = subparsers.add_parser("audit-image")
@@ -1304,6 +2232,27 @@ def _build_parser() -> argparse.ArgumentParser:
     image_parser.add_argument("--expected-config-id", required=True)
     image_parser.add_argument("--expected-manifest-digest", required=True)
     image_parser.set_defaults(handler=_audit_image_command)
+
+    freeze_parser = subparsers.add_parser("audit-freeze")
+    freeze_parser.add_argument("--source-root", required=True, type=Path)
+    freeze_parser.add_argument("--snapshot-root", required=True, type=Path)
+    freeze_parser.set_defaults(handler=_audit_freeze_command)
+
+    runtime_parser = subparsers.add_parser("audit-runtime")
+    runtime_parser.add_argument("--expected-root", required=True, type=Path)
+    runtime_parser.add_argument("--output", required=True, type=Path)
+    runtime_parser.set_defaults(handler=_audit_runtime_command)
+
+    source_lock_parser = subparsers.add_parser("audit-source-lock")
+    source_lock_parser.add_argument("source_lock", type=Path)
+    source_lock_parser.set_defaults(handler=_audit_source_lock_command)
+
+    bootstrap_parser = subparsers.add_parser("bootstrap")
+    bootstrap_parser.add_argument("--root", required=True, type=Path)
+    bootstrap_parser.add_argument(
+        "python_arguments", nargs=argparse.REMAINDER
+    )
+    bootstrap_parser.set_defaults(handler=_bootstrap_command)
     return parser
 
 

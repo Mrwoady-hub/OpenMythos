@@ -51,6 +51,38 @@ if [[ ${OPENMYTHOS_STABLE_KERNEL_DRIVER:-0} != 1 ]]; then
     exit 2
   fi
   mkdir -p -- "$bootstrap_builder"
+  stable_driver_root=
+  stable_driver=
+  bootstrap_cleanup() {
+    local status=$? cleanup_failed=0 root_parent root_basename
+    trap - EXIT
+    set +e
+    if [[ -n $stable_driver_root ]]; then
+      root_parent=$(dirname -- "$stable_driver_root")
+      root_basename=$(basename -- "$stable_driver_root")
+      if [[ $root_parent == "$bootstrap_builder" && \
+            $root_basename =~ ^\.kernel-driver\.[A-Za-z0-9]{8}$ && \
+            $stable_driver == "$stable_driver_root/build-kernel.sh" ]]; then
+        if [[ -e $stable_driver_root || -L $stable_driver_root ]]; then
+          chmod 0700 -- "$stable_driver_root" || cleanup_failed=1
+        fi
+        if [[ -e $stable_driver || -L $stable_driver ]]; then
+          rm -f -- "$stable_driver" || cleanup_failed=1
+        fi
+        if [[ -e $stable_driver_root || -L $stable_driver_root ]]; then
+          rmdir -- "$stable_driver_root" || cleanup_failed=1
+        fi
+      else
+        echo "refusing unsafe bootstrap driver cleanup" >&2
+        cleanup_failed=1
+      fi
+    fi
+    if [[ $status -eq 0 && $cleanup_failed -ne 0 ]]; then
+      status=1
+    fi
+    exit "$status"
+  }
+  trap bootstrap_cleanup EXIT
   stable_driver_root=$(mktemp -d -- "$bootstrap_builder/.kernel-driver.XXXXXXXX")
   stable_driver="$stable_driver_root/build-kernel.sh"
   before_identity=$(stat -c '%d:%i:%s:%Y:%Z' -- "$original_script")
@@ -70,12 +102,47 @@ if [[ ${OPENMYTHOS_STABLE_KERNEL_DRIVER:-0} != 1 ]]; then
   export OPENMYTHOS_STABLE_KERNEL_DRIVER_ROOT=$stable_driver_root
   export OPENMYTHOS_STABLE_KERNEL_DRIVER_SHA256=$stable_driver_sha
   exec /bin/bash "$stable_driver" "$builder_id"
-  status=$?
-  chmod 0700 -- "$stable_driver_root"
-  rm -f -- "$stable_driver"
-  rmdir -- "$stable_driver_root"
-  exit "$status"
 fi
+
+stable_cleanup_repo=${OPENMYTHOS_ORIGINAL_REPO:-}
+stable_cleanup_root=${OPENMYTHOS_STABLE_KERNEL_DRIVER_ROOT:-}
+stable_cleanup_script=$(realpath -m -- "${BASH_SOURCE[0]}")
+remove_stable_driver_copy() {
+  local expected_parent root_parent root_basename cleanup_failed=0
+  expected_parent="$stable_cleanup_repo/build/gate01/$builder_id"
+  root_parent=$(dirname -- "$stable_cleanup_root")
+  root_basename=$(basename -- "$stable_cleanup_root")
+  if [[ $stable_cleanup_repo != /* || \
+        $root_parent != "$expected_parent" || \
+        ! $root_basename =~ ^\.kernel-driver\.[A-Za-z0-9]{8}$ || \
+        $stable_cleanup_script != "$stable_cleanup_root/build-kernel.sh" ]]; then
+    echo "refusing unsafe stable driver cleanup" >&2
+    return 1
+  fi
+  if [[ ! -e $stable_cleanup_root && ! -L $stable_cleanup_root ]]; then
+    return 0
+  fi
+  chmod 0700 -- "$stable_cleanup_root" || cleanup_failed=1
+  if [[ -e $stable_cleanup_root/build-kernel.sh || \
+        -L $stable_cleanup_root/build-kernel.sh ]]; then
+    rm -f -- "$stable_cleanup_root/build-kernel.sh" || cleanup_failed=1
+  fi
+  if [[ -e $stable_cleanup_root || -L $stable_cleanup_root ]]; then
+    rmdir -- "$stable_cleanup_root" || cleanup_failed=1
+  fi
+  return "$cleanup_failed"
+}
+early_cleanup() {
+  local status=$? cleanup_failed=0
+  trap - EXIT
+  set +e
+  remove_stable_driver_copy || cleanup_failed=1
+  if [[ $status -eq 0 && $cleanup_failed -ne 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+trap early_cleanup EXIT
 
 umask "$ambient_umask"
 export TZ=$ambient_tz
@@ -84,8 +151,12 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 repo_root=$(realpath -- "${OPENMYTHOS_ORIGINAL_REPO:?}")
 original_script=$(realpath -- "${OPENMYTHOS_ORIGINAL_KERNEL_DRIVER:?}")
 stable_driver_root=$(realpath -- "${OPENMYTHOS_STABLE_KERNEL_DRIVER_ROOT:?}")
+stable_driver_parent=$(dirname -- "$stable_driver_root")
+stable_driver_basename=$(basename -- "$stable_driver_root")
 if [[ $original_script != "$repo_root/scripts/gate01/build-kernel.sh" || \
       $script_path != "$stable_driver_root/build-kernel.sh" || \
+      $stable_driver_parent != "$repo_root/build/gate01/$builder_id" || \
+      ! $stable_driver_basename =~ ^\.kernel-driver\.[A-Za-z0-9]{8}$ || \
       $(sha256sum -- "$script_path" | awk '{print $1}') != \
         "${OPENMYTHOS_STABLE_KERNEL_DRIVER_SHA256:?}" ]]; then
   echo "stable kernel build driver identity is invalid" >&2
@@ -105,7 +176,7 @@ if [[ $builder_root != "$gate_root/$builder_id" || \
       $inspection_work != "$builder_root/kernel-inspection" || \
       $build_podman_root != "$builder_root/kernel-podman-build" || \
       $inspect_podman_root != "$builder_root/kernel-podman-inspect" || \
-      $stable_driver_root != "$builder_root"/.kernel-driver.* ]]; then
+      $stable_driver_parent != "$builder_root" ]]; then
   echo "refusing kernel paths outside the selected Gate 01 builder" >&2
   exit 2
 fi
@@ -114,7 +185,7 @@ remove_builder_tree() {
   case "$1" in
     "$output"|"$runtime_root"|"$inspection_work"|\
     "$build_podman_root"|"$inspect_podman_root")
-      if [[ -e $1 ]]; then
+      if [[ -e $1 || -L $1 ]]; then
         podman unshare rm -rf -- "$1"
       fi
       ;;
@@ -141,13 +212,30 @@ public_certificate="$gate_root/secrets/module-signing.pem"
 public_manifest="$gate_root/secrets/module-key.json"
 private_key="$gate_root/secrets/module-signing.key"
 spec="$repo_root/os/kernel/packaging/kernel-openmythos.spec"
-verifier="$repo_root/tools/gate01/rpm_artifacts.py"
+frozen_python_root="$runtime_root/frozen-python"
+proof_helper_relative_paths=(
+  tools/__init__.py
+  tools/gate01/__init__.py
+  tools/gate01/inputs.py
+  tools/gate01/kernel_config.py
+  tools/gate01/module_key.py
+  tools/gate01/rpm_artifacts.py
+  tools/gate01/toolchain.py
+)
+proof_source_relative_paths=(
+  scripts/gate01/build-kernel.sh
+  os/kernel/packaging/kernel-openmythos.spec
+  "${proof_helper_relative_paths[@]}"
+)
 
 required_inputs=(
   "$source_lock" "$toolchain_lock" "$source_archive" "$toolchain_archive"
   "$config" "$config_checksum" "$config_requirements" "$public_certificate"
-  "$public_manifest" "$private_key" "$spec" "$verifier" "$original_script"
+  "$public_manifest" "$private_key" "$spec" "$original_script"
 )
+for relative_path in "${proof_helper_relative_paths[@]}"; do
+  required_inputs+=("$repo_root/$relative_path")
+done
 for path in "${required_inputs[@]}"; do
   if [[ ! -f $path || -L $path ]]; then
     echo "required regular file is missing or a symlink: $path" >&2
@@ -161,12 +249,24 @@ fi
 
 output_scan_complete=0
 source_freeze_verified=0
+retained_rpm_binding_verified=0
+frozen_helpers_ready=0
+
+run_frozen_python() (
+  cd "$runtime_root"
+  python3 -I -S -B \
+    "$frozen_python_root/tools/gate01/rpm_artifacts.py" \
+    bootstrap --root "$frozen_python_root" -- "$@"
+)
 
 scan_output_tree() {
   local scan_output scan_status
+  if [[ $frozen_helpers_ready -ne 1 ]]; then
+    return 2
+  fi
   scan_output=$(mktemp -- "$gate_root/.kernel-scan.XXXXXXXX")
   set +e
-  PYTHONPATH="$repo_root" python3 -m tools.gate01.module_key scan \
+  run_frozen_python -m tools.gate01.module_key scan \
     --private-key "$private_key" --root "$output" >"$scan_output"
   scan_status=$?
   set -e
@@ -175,27 +275,36 @@ scan_output_tree() {
 }
 
 cleanup() {
-  local status=$?
+  local status=$? cleanup_failed=0
   trap - EXIT
   set +e
-  remove_builder_tree "$build_podman_root"
-  remove_builder_tree "$inspect_podman_root"
-  remove_builder_tree "$inspection_work"
-  remove_builder_tree "$runtime_root"
+  remove_builder_tree "$build_podman_root" || cleanup_failed=1
+  remove_builder_tree "$inspect_podman_root" || cleanup_failed=1
+  remove_builder_tree "$inspection_work" || cleanup_failed=1
   if [[ $output_scan_complete -eq 0 && -d $output ]]; then
-    if ! scan_output_tree; then
-      chmod -R 0700 -- "$output"
+    if [[ $frozen_helpers_ready -ne 1 ]]; then
+      chmod -R 0700 -- "$output" || cleanup_failed=1
+      echo "frozen output scanner unavailable for $output" >&2
+      cleanup_failed=1
+    elif ! scan_output_tree; then
+      chmod -R 0700 -- "$output" || cleanup_failed=1
       echo "private key leakage detected in $output" >&2
-      status=1
+      cleanup_failed=1
     fi
   fi
+  remove_builder_tree "$runtime_root" || cleanup_failed=1
   if [[ $source_freeze_verified -eq 0 && $status -eq 0 ]]; then
     echo "source freeze was not verified" >&2
+    cleanup_failed=1
+  fi
+  if [[ $retained_rpm_binding_verified -eq 0 && $status -eq 0 ]]; then
+    echo "retained RPM binding was not verified" >&2
+    cleanup_failed=1
+  fi
+  remove_stable_driver_copy || cleanup_failed=1
+  if [[ $status -eq 0 && $cleanup_failed -ne 0 ]]; then
     status=1
   fi
-  chmod 0700 -- "$stable_driver_root" 2>/dev/null
-  rm -f -- "$stable_driver_root/build-kernel.sh"
-  rmdir -- "$stable_driver_root" 2>/dev/null
   exit "$status"
 }
 trap cleanup EXIT
@@ -206,10 +315,10 @@ remove_builder_tree "$inspection_work"
 remove_builder_tree "$build_podman_root"
 remove_builder_tree "$inspect_podman_root"
 mkdir -p -- "$output" "$runtime_root/source-snapshot" \
-  "$runtime_root/verifier/tools/gate01" "$inspection_work"
+  "$frozen_python_root/tools/gate01" "$inspection_work"
 chmod 0700 -- "$runtime_root" "$runtime_root/source-snapshot" \
-  "$runtime_root/verifier" "$runtime_root/verifier/tools" \
-  "$runtime_root/verifier/tools/gate01" "$inspection_work"
+  "$frozen_python_root" "$frozen_python_root/tools" \
+  "$frozen_python_root/tools/gate01" "$inspection_work"
 
 snapshot_regular() {
   local input=$1 output_path=$2 mode=$3 before after
@@ -232,7 +341,6 @@ snapshot_config_requirements="$runtime_root/source-snapshot/requirements.json"
 snapshot_public_certificate="$runtime_root/source-snapshot/module-signing.pem"
 snapshot_public_manifest="$runtime_root/source-snapshot/module-key.json"
 snapshot_spec="$runtime_root/source-snapshot/kernel-openmythos.spec"
-snapshot_verifier="$runtime_root/verifier/tools/gate01/rpm_artifacts.py"
 
 snapshot_regular "$source_lock" "$snapshot_source_lock" 0444
 snapshot_regular "$toolchain_lock" "$snapshot_toolchain_lock" 0444
@@ -244,26 +352,34 @@ snapshot_regular "$config_requirements" "$snapshot_config_requirements" 0444
 snapshot_regular "$public_certificate" "$snapshot_public_certificate" 0444
 snapshot_regular "$public_manifest" "$snapshot_public_manifest" 0444
 snapshot_regular "$spec" "$snapshot_spec" 0444
-snapshot_regular "$verifier" "$snapshot_verifier" 0444
-chmod 0555 -- "$runtime_root/source-snapshot" "$runtime_root/verifier" \
-  "$runtime_root/verifier/tools" "$runtime_root/verifier/tools/gate01"
+for relative_path in "${proof_helper_relative_paths[@]}"; do
+  snapshot_regular \
+    "$repo_root/$relative_path" "$frozen_python_root/$relative_path" 0444
+done
+chmod 0555 -- "$runtime_root/source-snapshot" "$frozen_python_root" \
+  "$frozen_python_root/tools" "$frozen_python_root/tools/gate01"
+frozen_helpers_ready=1
+
+python_runtime_evidence="$runtime_root/python-runtime.json"
+run_frozen_python -m tools.gate01.rpm_artifacts audit-runtime \
+  --expected-root "$frozen_python_root" --output "$python_runtime_evidence"
+
+proof_source_before="$runtime_root/proof-source-before.sha256"
+(
+  cd "$repo_root"
+  sha256sum "${proof_source_relative_paths[@]}"
+) >"$proof_source_before"
+chmod 0444 -- "$proof_source_before"
+
+run_frozen_python -m tools.gate01.rpm_artifacts audit-freeze \
+  --source-root "$repo_root" --snapshot-root "$frozen_python_root"
 if ! cmp -s -- "$spec" "$snapshot_spec" || \
-   ! cmp -s -- "$verifier" "$snapshot_verifier" || \
    [[ $(sha256sum -- "$original_script" | awk '{print $1}') != \
       "${OPENMYTHOS_STABLE_KERNEL_DRIVER_SHA256}" ]]; then
   echo "Task 6 source changed while snapshots were being frozen" >&2
   exit 1
 fi
 
-task6_source_manifest="$runtime_root/task6-source.sha256"
-(
-  cd "$repo_root"
-  sha256sum \
-    scripts/gate01/build-kernel.sh \
-    os/kernel/packaging/kernel-openmythos.spec \
-    tools/gate01/rpm_artifacts.py
-) >"$task6_source_manifest"
-chmod 0444 -- "$task6_source_manifest"
 snapshot_manifest="$runtime_root/snapshot.sha256"
 (
   cd "$runtime_root"
@@ -277,19 +393,16 @@ snapshot_manifest="$runtime_root/snapshot.sha256"
     source-snapshot/requirements.json \
     source-snapshot/module-signing.pem \
     source-snapshot/module-key.json \
-    source-snapshot/kernel-openmythos.spec \
-    verifier/tools/gate01/rpm_artifacts.py
+    source-snapshot/kernel-openmythos.spec
+  for relative_path in "${proof_helper_relative_paths[@]}"; do
+    sha256sum "frozen-python/$relative_path"
+  done
 ) >"$snapshot_manifest"
 chmod 0444 -- "$snapshot_manifest"
 
-PYTHONPATH="$repo_root" python3 -c '
-import sys
-from pathlib import Path
-from tools.gate01.inputs import load_source_lock, validate_source_lock
-lock = load_source_lock(Path(sys.argv[1]))
-validate_source_lock(lock)
-' "$snapshot_source_lock"
-PYTHONPATH="$repo_root" python3 -m tools.gate01.toolchain verify \
+run_frozen_python -m tools.gate01.rpm_artifacts \
+  audit-source-lock "$snapshot_source_lock"
+run_frozen_python -m tools.gate01.toolchain verify \
   "$snapshot_toolchain_lock" --archive "$snapshot_toolchain_archive"
 source_sha=$(jq -er '.archive_sha256' "$snapshot_source_lock")
 printf '%s  %s\n' "$source_sha" "$snapshot_source_archive" | \
@@ -298,7 +411,7 @@ printf '%s  %s\n' "$source_sha" "$snapshot_source_archive" | \
   cd "$runtime_root/source-snapshot"
   sha256sum --check --status "$(basename "$snapshot_config_checksum")"
 )
-PYTHONPATH="$repo_root" python3 -m tools.gate01.kernel_config audit \
+run_frozen_python -m tools.gate01.kernel_config audit \
   --config "$snapshot_config" --requirements "$snapshot_config_requirements"
 config_sha=$(awk 'NF == 2 {print $1}' "$snapshot_config_checksum")
 if [[ ! $config_sha =~ ^[0-9a-f]{64}$ ]]; then
@@ -307,7 +420,7 @@ if [[ ! $config_sha =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 certificate_check=$(mktemp -- "$runtime_root/.module-key-check.XXXXXXXX")
-PYTHONPATH="$repo_root" python3 -m tools.gate01.module_key describe \
+run_frozen_python -m tools.gate01.module_key describe \
   --certificate "$snapshot_public_certificate" --output "$certificate_check"
 cmp -s -- "$certificate_check" "$snapshot_public_manifest" || {
   echo "public module certificate does not match its manifest" >&2
@@ -333,6 +446,35 @@ if [[ ! $toolchain_image_id =~ ^sha256:[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
+build_work_target=/work
+private_key_target=/run/secrets/module-signing.key
+frozen_python_target=/verifier
+public_certificate_target=/public/module-signing.pem
+binary_rpms_target=/rpm-root
+source_rpms_target=/srpms
+inspection_work_target=/inspect
+
+declare -ar build_volume_specs=(
+  "$output:$build_work_target:rw"
+  "$private_key:$private_key_target:ro"
+)
+declare -ar inspection_volume_specs=(
+  "$frozen_python_root:$frozen_python_target:ro"
+  "$snapshot_public_certificate:$public_certificate_target:ro"
+  "$output/rpmbuild/RPMS:$binary_rpms_target:ro"
+  "$output/rpmbuild/SRPMS:$source_rpms_target:ro"
+  "$inspection_work:$inspection_work_target:rw"
+)
+declare -a build_mount_args=()
+declare -a inspection_mount_args=()
+for volume_spec in "${build_volume_specs[@]}"; do
+  build_mount_args+=(--volume "$volume_spec")
+done
+for volume_spec in "${inspection_volume_specs[@]}"; do
+  inspection_mount_args+=(--volume "$volume_spec")
+done
+readonly -a build_mount_args inspection_mount_args
+
 isolation_plan="$runtime_root/container-isolation.json"
 jq -n \
   --arg repository_root "$repo_root" \
@@ -340,44 +482,68 @@ jq -n \
   --arg build_store "$build_podman_root" \
   --arg inspection_store "$inspect_podman_root" \
   --arg private_key "$private_key" \
-  --arg verifier_snapshot "$runtime_root/verifier" \
+  --arg verifier_snapshot "$frozen_python_root" \
   --arg public_certificate "$snapshot_public_certificate" \
-  --arg rpms "$output/rpmbuild/RPMS/x86_64" \
+  --arg rpms "$output/rpmbuild/RPMS" \
   --arg srpms "$output/rpmbuild/SRPMS" \
   --arg inspection_work "$inspection_work" \
+  --arg build_work_target "$build_work_target" \
+  --arg private_key_target "$private_key_target" \
+  --arg frozen_python_target "$frozen_python_target" \
+  --arg public_certificate_target "$public_certificate_target" \
+  --arg binary_rpms_target "$binary_rpms_target" \
+  --arg source_rpms_target "$source_rpms_target" \
+  --arg inspection_work_target "$inspection_work_target" \
   '{
     repository_root: $repository_root,
     output: $output,
     build_store: $build_store,
     inspection_store: $inspection_store,
+    private_key_source: $private_key,
+    public_certificate_source: $public_certificate,
     signing_environment: {probe: false, build: true, inspection: false},
     probe_mounts: [],
     build_mounts: [
-      {source: $output, target: "/work", read_only: false},
+      {source: $output, target: $build_work_target, read_only: false},
       {
         source: $private_key,
-        target: "/run/secrets/module-signing.key",
+        target: $private_key_target,
         read_only: true
       }
     ],
     inspection_mounts: [
-      {source: $verifier_snapshot, target: "/verifier", read_only: true},
       {
-        source: $public_certificate,
-        target: "/public/module-signing.pem",
+        source: $verifier_snapshot,
+        target: $frozen_python_target,
         read_only: true
       },
-      {source: $rpms, target: "/rpms", read_only: true},
-      {source: $srpms, target: "/srpms", read_only: true},
-      {source: $inspection_work, target: "/inspect", read_only: false}
+      {
+        source: $public_certificate,
+        target: $public_certificate_target,
+        read_only: true
+      },
+      {source: $rpms, target: $binary_rpms_target, read_only: true},
+      {source: $srpms, target: $source_rpms_target, read_only: true},
+      {
+        source: $inspection_work,
+        target: $inspection_work_target,
+        read_only: false
+      }
     ]
   }' >"$isolation_plan"
 chmod 0444 -- "$isolation_plan"
-(
-  cd "$runtime_root/verifier"
-  PYTHONDONTWRITEBYTECODE=1 python3 -m tools.gate01.rpm_artifacts \
-    audit-isolation --plan "$isolation_plan"
-)
+declare -a isolation_audit_args=()
+for volume_spec in "${build_volume_specs[@]}"; do
+  isolation_audit_args+=(--build-volume "$volume_spec")
+done
+for volume_spec in "${inspection_volume_specs[@]}"; do
+  isolation_audit_args+=(--inspection-volume "$volume_spec")
+done
+run_frozen_python -m tools.gate01.rpm_artifacts audit-isolation \
+  --plan "$isolation_plan" "${isolation_audit_args[@]}"
+# The plan has been consumed exactly once.  Podman receives the already-audited
+# readonly arrays above; no later file parse can substitute unaudited mounts.
+chmod 0000 -- "$isolation_plan"
 
 mkdir -p -- "$output/rpmbuild"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 chmod 0755 -- "$output" "$output/rpmbuild" "$output/rpmbuild"/*
@@ -410,14 +576,11 @@ initialize_podman_store() {
   observed_manifest_digest=$(
     "${command_ref[@]}" image inspect --format '{{.Digest}}' "$toolchain_image_id"
   )
-  (
-    cd "$runtime_root/verifier"
-    PYTHONDONTWRITEBYTECODE=1 python3 -m tools.gate01.rpm_artifacts audit-image \
-      --observed-config-id "$observed_config_id" \
-      --observed-manifest-digest "$observed_manifest_digest" \
-      --expected-config-id "$toolchain_image_id" \
-      --expected-manifest-digest "$toolchain_manifest"
-  )
+  run_frozen_python -m tools.gate01.rpm_artifacts audit-image \
+    --observed-config-id "$observed_config_id" \
+    --observed-manifest-digest "$observed_manifest_digest" \
+    --expected-config-id "$toolchain_image_id" \
+    --expected-manifest-digest "$toolchain_manifest"
 }
 
 declare -a build_podman_cmd=()
@@ -447,9 +610,8 @@ set +e
 # Only this rpmbuild container receives the private key and signing variable.
 # shellcheck disable=SC2016
 "${build_podman_cmd[@]}" "${container_security[@]}" \
-  --volume "$output:/work:rw" \
-  --volume "$private_key:/run/secrets/module-signing.key:ro" \
-  --env OPENMYTHOS_MODULE_SIGNING_KEY=/run/secrets/module-signing.key \
+  "${build_mount_args[@]}" \
+  --env "OPENMYTHOS_MODULE_SIGNING_KEY=$private_key_target" \
   --env "OPENMYTHOS_CONFIG_SHA256=$config_sha" \
   --entrypoint /bin/bash "$toolchain_image_id" -Eeuo pipefail -c '
 cd /work
@@ -487,6 +649,15 @@ expected_binary_rpms=(
   "kernel-openmythos-core-6.18.48-1.openmythos.fc44.x86_64.rpm"
   "kernel-openmythos-modules-6.18.48-1.openmythos.fc44.x86_64.rpm"
 )
+mapfile -t observed_rpm_root_entries < <(
+  find "$output/rpmbuild/RPMS" -mindepth 1 -maxdepth 1 \
+    -printf '%f:%y\n' | LC_ALL=C sort
+)
+if [[ ${#observed_rpm_root_entries[@]} -ne 1 || \
+      ${observed_rpm_root_entries[0]} != "x86_64:d" ]]; then
+  echo "kernel build RPM root must contain only the x86_64 directory" >&2
+  exit 1
+fi
 mapfile -t observed_srpms < <(
   find "$output/rpmbuild/SRPMS" -maxdepth 1 -type f -name '*.rpm' -printf '%f\n' |
     LC_ALL=C sort
@@ -496,7 +667,8 @@ if [[ ${#observed_srpms[@]} -ne 1 || ${observed_srpms[0]} != "$expected_srpm" ]]
   exit 1
 fi
 mapfile -t observed_binary_rpms < <(
-  find "$output/rpmbuild/RPMS" -type f -name '*.rpm' -printf '%f\n' |
+  find "$output/rpmbuild/RPMS/x86_64" -maxdepth 1 -type f -name '*.rpm' \
+    -printf '%f\n' |
     LC_ALL=C sort
 )
 if [[ ${#observed_binary_rpms[@]} -ne 3 ]]; then
@@ -517,26 +689,30 @@ declare -a inspect_podman_cmd=()
 initialize_podman_store "$inspect_podman_root" inspect_podman_cmd
 mkdir -p -- "$inspection_work/evidence"
 chmod 0755 -- "$inspection_work" "$inspection_work/evidence"
-"${inspect_podman_cmd[@]}" "${container_security[@]}" \
-  --volume "$runtime_root/verifier:/verifier:ro" \
-  --volume "$snapshot_public_certificate:/public/module-signing.pem:ro" \
-  --volume "$output/rpmbuild/RPMS/x86_64:/rpms:ro" \
-  --volume "$output/rpmbuild/SRPMS:/srpms:ro" \
-  --volume "$inspection_work:/inspect:rw" \
-  --env PYTHONPATH=/verifier \
-  --entrypoint /bin/bash "$toolchain_image_id" -Eeuo pipefail -c '
-python3 -m tools.gate01.rpm_artifacts inspect \
-  --rpm-dir /rpms \
-  --srpm-dir /srpms \
-  --output /inspect/evidence/rpm-artifacts.json \
-  --extract-root /inspect/extracted \
-  --public-certificate /public/module-signing.pem
-'
-(
-  cd "$runtime_root/verifier"
-  PYTHONDONTWRITEBYTECODE=1 python3 -m tools.gate01.rpm_artifacts validate \
-    "$inspection_work/evidence/rpm-artifacts.json"
+inspected_rpm_manifest_sha256=$(
+  "${inspect_podman_cmd[@]}" "${container_security[@]}" \
+    "${inspection_mount_args[@]}" \
+    --workdir /tmp --entrypoint python3 "$toolchain_image_id" \
+    -I -S -B /verifier/tools/gate01/rpm_artifacts.py \
+    bootstrap --root /verifier -- -m tools.gate01.rpm_artifacts inspect \
+    --rpm-dir /rpm-root/x86_64 \
+    --srpm-dir /srpms \
+    --output /inspect/evidence/rpm-artifacts.json \
+    --extract-root /inspect/extracted \
+    --public-certificate /public/module-signing.pem \
+    --print-manifest-sha256
 )
+if [[ ! $inspected_rpm_manifest_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+  echo "inspected RPM manifest SHA-256 is malformed" >&2
+  exit 1
+fi
+readonly inspected_rpm_manifest_sha256
+run_frozen_python -m tools.gate01.rpm_artifacts validate \
+  "$inspection_work/evidence/rpm-artifacts.json"
+run_frozen_python -m tools.gate01.rpm_artifacts rebind \
+  --rpm-dir "$output/rpmbuild/RPMS/x86_64" \
+  --srpm-dir "$output/rpmbuild/SRPMS" \
+  --manifest "$inspection_work/evidence/rpm-artifacts.json"
 remove_builder_tree "$inspect_podman_root"
 
 mv -- "$inspection_work/evidence/rpm-artifacts.json" "$output/rpm-artifacts.json"
@@ -572,13 +748,16 @@ jq -n \
     },
     isolation: {
       stable_driver_snapshot: true,
-      frozen_spec_and_verifier: true,
+      frozen_spec_and_python_closure: true,
       build_and_inspection_stores_distinct: true,
       stores_visible_inside_containers: false,
       probe_private_key_mounted: false,
       inspector_private_key_mounted: false,
       inspector_public_certificate_only: true,
-      recursive_repository_mount: false
+      recursive_repository_mount: false,
+      retained_rpm_binding: true,
+      joint_source_and_rpm_final_boundary: true,
+      isolated_python_flags: ["-I", "-S", "-B"]
     },
     compiler_version: $compiler_version,
     toolchain_manifest_digest: $toolchain_manifest,
@@ -586,12 +765,19 @@ jq -n \
     peak_output_bytes: $peak_output_bytes,
     network_used: false
   }' >"$output/build-report.json"
-install -m 0644 -- "$snapshot_manifest" "$output/source-snapshot.sha256"
 
+proof_source_after="$runtime_root/proof-source-after.sha256"
 (
   cd "$repo_root"
-  sha256sum --check --status "$task6_source_manifest"
-)
+  sha256sum "${proof_source_relative_paths[@]}"
+) >"$proof_source_after"
+chmod 0444 -- "$proof_source_after"
+if ! cmp -s -- "$proof_source_before" "$proof_source_after"; then
+  echo "proof-relevant repository sources changed during build" >&2
+  exit 1
+fi
+run_frozen_python -m tools.gate01.rpm_artifacts audit-freeze \
+  --source-root "$repo_root" --snapshot-root "$frozen_python_root"
 (
   cd "$runtime_root"
   sha256sum --check --status "$snapshot_manifest"
@@ -601,7 +787,23 @@ if [[ $(sha256sum -- "$original_script" | awk '{print $1}') != \
   echo "kernel build driver changed during proof" >&2
   exit 1
 fi
-source_freeze_verified=1
+
+proof_source_final="$runtime_root/proof-source-final.sha256"
+(
+  cd "$repo_root"
+  sha256sum "${proof_source_relative_paths[@]}"
+) >"$proof_source_final"
+chmod 0444 -- "$proof_source_final"
+if ! cmp -s -- "$proof_source_before" "$proof_source_final" || \
+   ! cmp -s -- "$proof_source_after" "$proof_source_final"; then
+  echo "proof-relevant repository sources changed before final binding" >&2
+  exit 1
+fi
+install -m 0644 -- "$proof_source_before" "$output/proof-source-before.sha256"
+install -m 0644 -- "$proof_source_after" "$output/proof-source-after.sha256"
+install -m 0644 -- "$proof_source_final" "$output/proof-source-final.sha256"
+install -m 0644 -- "$snapshot_manifest" "$output/source-snapshot.sha256"
+install -m 0644 -- "$python_runtime_evidence" "$output/python-runtime.json"
 
 set +e
 scan_output_tree
@@ -615,6 +817,22 @@ if [[ $scan_status -ne 0 ]]; then
 fi
 find "$output" -type d -exec chmod 0755 -- {} +
 find "$output" -type f -exec chmod 0644 -- {} +
+
+# This sole final proof call holds every source, frozen copy, manifest, and RPM
+# descriptor together across two hashes and one global path/topology sweep.
+run_frozen_python -m tools.gate01.rpm_artifacts bind-final \
+  --rpm-dir "$output/rpmbuild/RPMS/x86_64" \
+  --srpm-dir "$output/rpmbuild/SRPMS" \
+  --rpm-manifest "$output/rpm-artifacts.json" \
+  --expected-rpm-manifest-sha256 "$inspected_rpm_manifest_sha256" \
+  --source-root "$repo_root" \
+  --snapshot-root "$frozen_python_root" \
+  --spec-snapshot "$snapshot_spec" \
+  --driver-snapshot "$script_path" \
+  --expected-source-manifest "$proof_source_before" \
+  --final-source-manifest "$output/proof-source-final.sha256"
+source_freeze_verified=1
+retained_rpm_binding_verified=1
 
 printf 'built %s kernel RPM set in %s seconds at %s\n' \
   "$builder_id" "$elapsed_seconds" "$output"
