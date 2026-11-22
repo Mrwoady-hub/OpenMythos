@@ -1,6 +1,8 @@
 import io
+import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -114,8 +116,101 @@ class ModuleKeyDescribeTests(unittest.TestCase):
             any("PRIVATE KEY" in str(value) for value in manifest.values())
         )
 
+    def test_describe_descriptor_survives_certificate_path_replacement(self) -> None:
+        descriptor = os.open(
+            self.certificate, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            expected = module_key.describe_descriptor(descriptor)
+            replacement = self.root / "replacement.pem"
+            replacement.write_text("not a certificate\n", encoding="ascii")
+            replacement.replace(self.certificate)
+            self.assertEqual(module_key.describe_descriptor(descriptor), expected)
+            certificate = os.pread(descriptor, os.fstat(descriptor).st_size, 0)
+            self.assertEqual(
+                expected["certificate_sha256"], hashlib.sha256(certificate).hexdigest()
+            )
+        finally:
+            os.close(descriptor)
+
 
 class ModuleKeyScanTests(unittest.TestCase):
+    def test_scanner_checks_decoded_rpm_metadata_not_only_json_encoded_bytes(self) -> None:
+        marker = "-----BEGIN PRIVATE KEY-----"
+        escaped = "".join("\\u%04x" % ord(character) for character in marker)
+        (self.scan_root / "rpm-artifacts.json").write_text('{"binary_rpms":[{"security_metadata":{"candidate":"' + escaped + '"}}]}\n', encoding="ascii")
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"private-key leakage detected\n")
+        self.assertEqual(result.stderr, b"")
+
+    def test_scanner_checks_names_symlink_targets_and_xattrs_without_echoing_them(self) -> None:
+        marker = b"-----BEGIN PRIVATE KEY-----"
+        for role in ("name", "symlink", "file-xattr", "directory-xattr"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory(dir=self.root) as name:
+                target = Path(name)
+                if role == "name":
+                    (target / marker.decode()).write_bytes(b"public")
+                elif role == "symlink":
+                    (target / "link").symlink_to(marker.decode())
+                elif role == "file-xattr":
+                    payload = target / "public"
+                    payload.write_bytes(b"public")
+                    os.setxattr(payload, "user.secret", marker)
+                else:
+                    os.setxattr(target, "user.secret", marker)
+                key_fd = os.open(self.private_key, os.O_RDONLY | os.O_CLOEXEC)
+                root_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                output = io.StringIO()
+                try:
+                    with redirect_stdout(output):
+                        result = module_key.scan_descriptors(key_fd, root_fd)
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output.getvalue(), "private-key leakage detected\n")
+                finally:
+                    os.close(root_fd)
+                    os.close(key_fd)
+
+    def test_scanner_rejects_special_nodes_without_blocking(self) -> None:
+        for role in ("fifo", "socket"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory(dir=self.root) as name:
+                root = Path(name)
+                if role == "fifo":
+                    os.mkfifo(root / "special")
+                else:
+                    os.mknod(root / "special", stat.S_IFSOCK | 0o600)
+                with self.assertRaisesRegex(RuntimeError, "unsupported node"):
+                    module_key.scan(self.private_key, root)
+
+    def test_scanner_terminal_sweep_rejects_prior_child_mutation_in_each_pass(self) -> None:
+        first = self.scan_root / "a"
+        second = self.scan_root / "b"
+        for mutate_at in (2, 4):
+            with self.subTest(mutate_at=mutate_at):
+                first.write_bytes(b"public")
+                second.write_bytes(b"public")
+                original = module_key._descriptor_contains_secret
+                calls = 0
+                def scan_then_mutate(descriptor: int, patterns: tuple[bytes, bytes]) -> bool:
+                    nonlocal calls
+                    result = original(descriptor, patterns)
+                    calls += 1
+                    if calls == mutate_at:
+                        first.write_bytes(b"secret")
+                        first.write_bytes(b"public")
+                    return result
+                with mock.patch.object(module_key, "_descriptor_contains_secret", side_effect=scan_then_mutate):
+                    with self.assertRaisesRegex(RuntimeError, "changed during traversal"):
+                        module_key.scan(self.private_key, self.scan_root)
+
+    def test_scanner_content_leakage_uses_only_a_fixed_public_diagnostic(self) -> None:
+        malicious_name = "attacker-controlled-secret-fragment"
+        (self.scan_root / malicious_name).write_bytes(b"-----BEGIN PRIVATE KEY-----")
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"private-key leakage detected\n")
+        self.assertEqual(result.stderr, b"")
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -182,7 +277,7 @@ class ModuleKeyScanTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout, b"")
 
-    def test_scan_reports_paths_containing_complete_pem_or_der_secret(self) -> None:
+    def test_scan_reports_redacted_failure_for_complete_pem_or_der_secret(self) -> None:
         (self.scan_root / "pem-copy.bin").write_bytes(
             b"prefix\n" + self.private_key.read_bytes() + b"suffix\n"
         )
@@ -207,7 +302,7 @@ class ModuleKeyScanTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             result.stdout.decode().splitlines(),
-            ["nested/der-copy.bin", "pem-copy.bin"],
+            ["private-key leakage detected"],
         )
         self.assertNotIn(self.private_key.read_bytes(), result.stdout)
 
@@ -220,7 +315,7 @@ class ModuleKeyScanTests(unittest.TestCase):
         result = self.scan()
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, b"marker.txt\n")
+        self.assertEqual(result.stdout, b"private-key leakage detected\n")
 
     def test_scan_does_not_follow_file_or_directory_symlinks(self) -> None:
         outside_directory = self.root / "outside-directory"
@@ -305,7 +400,7 @@ class ModuleKeyScanTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(
             scan_output.getvalue().splitlines(),
-            ["der.bin", "marker.bin", "pem.bin"],
+            ["private-key leakage detected"],
         )
         self.assertTrue(read_sizes, "scanner bypassed bounded os.read calls")
         self.assertLessEqual(max(read_sizes), chunk_size)
@@ -335,6 +430,109 @@ class ModuleKeyScanTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertGreater(len(read_sizes), 16)
         self.assertLessEqual(max(read_sizes), chunk_size)
+
+    def test_descriptor_scan_uses_exact_held_key_and_root_inodes(self) -> None:
+        (self.scan_root / "public.txt").write_bytes(b"public\n")
+        key_fd = os.open(
+            self.private_key, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        root_fd = os.open(
+            self.scan_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        try:
+            original_key = self.private_key.read_bytes()
+            replacement = self.root / "replacement.key"
+            replacement.write_bytes(b"not the signing key")
+            replacement.replace(self.private_key)
+            (self.scan_root / "leak.bin").write_bytes(original_key)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = module_key.scan_descriptors(key_fd, root_fd)
+            self.assertEqual(result, 1)
+            self.assertEqual(output.getvalue(), "private-key leakage detected\n")
+        finally:
+            os.close(root_fd)
+            os.close(key_fd)
+
+    def test_descriptor_scan_rejects_tree_change_after_secret_scan(self) -> None:
+        payload = self.scan_root / "payload"
+        payload.write_bytes(b"public\n")
+        key_fd = os.open(
+            self.private_key, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        root_fd = os.open(
+            self.scan_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        original = module_key._descriptor_contains_secret
+        attacked = False
+
+        def inject_after_scan(
+            descriptor: int, exact_patterns: tuple[bytes, bytes]
+        ) -> bool:
+            nonlocal attacked
+            value = original(descriptor, exact_patterns)
+            if not attacked:
+                payload.write_bytes(self.private_key.read_bytes())
+                attacked = True
+            return value
+
+        try:
+            with mock.patch.object(
+                module_key,
+                "_descriptor_contains_secret",
+                side_effect=inject_after_scan,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed during traversal"):
+                    module_key.scan_descriptors(key_fd, root_fd)
+        finally:
+            os.close(root_fd)
+            os.close(key_fd)
+
+    def test_held_artifact_descriptors_are_scanned_without_path_reopen(self) -> None:
+        clean = os.memfd_create("clean", os.MFD_CLOEXEC)
+        leaked = os.memfd_create("leaked", os.MFD_CLOEXEC)
+        os.write(clean, b"ordinary RPM bytes")
+        os.write(leaked, b"prefix" + self.private_key.read_bytes() + b"suffix")
+        key_descriptor = os.open(
+            self.private_key, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            self.assertEqual(
+                module_key.scan_file_descriptors(
+                    key_descriptor, {"clean": clean, "leaked": leaked}
+                ),
+                ["leaked"],
+            )
+        finally:
+            os.close(key_descriptor)
+            os.close(clean)
+            os.close(leaked)
+
+    def test_held_scan_terminal_sweep_rejects_prior_file_mutation_on_second_pass(self) -> None:
+        descriptors = {label: os.memfd_create(label, os.MFD_CLOEXEC) for label in ("a", "b")}
+        key = os.open(self.private_key, os.O_RDONLY | os.O_CLOEXEC)
+        for descriptor in descriptors.values():
+            os.write(descriptor, b"public")
+        original = module_key._descriptor_contains_secret
+        calls = 0
+        def scan_then_mutate(descriptor: int, patterns: tuple[bytes, bytes]) -> bool:
+            nonlocal calls
+            result = original(descriptor, patterns)
+            calls += 1
+            if calls == 4:
+                os.pwrite(descriptors["a"], b"secret", 0)
+                os.pwrite(descriptors["a"], b"public", 0)
+            return result
+        try:
+            with mock.patch.object(module_key, "_descriptor_contains_secret", side_effect=scan_then_mutate):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    module_key.scan_file_descriptors(key, descriptors)
+        finally:
+            os.close(key)
+            for descriptor in descriptors.values():
+                os.close(descriptor)
 
 
 class DevelopmentKeyScriptTests(unittest.TestCase):

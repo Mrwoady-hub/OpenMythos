@@ -7,6 +7,84 @@
       "name": "kernel-openmythos",
       "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64",
       "release": "1.openmythos.fc44",
+      "security_metadata": {
+        "dependencies": {
+          "conflicts": [],
+          "enhances": [],
+          "obsoletes": [],
+          "order": [],
+          "provides": [
+            {
+              "flags": 0,
+              "name": "installonlypkg(kernel)",
+              "version": ""
+            },
+            {
+              "flags": 8,
+              "name": "kernel",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos(x86-64)",
+              "version": "6.18.48-1.openmythos.fc44"
+            }
+          ],
+          "recommends": [],
+          "requires": [
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-modules-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(CompressedFileNames)",
+              "version": "3.0.4-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(FileDigests)",
+              "version": "4.6.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadFilesHavePrefix)",
+              "version": "4.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadIsZstd)",
+              "version": "5.4.18-1"
+            }
+          ],
+          "suggests": [],
+          "supplements": []
+        },
+        "files": [],
+        "forbidden_tags": [],
+        "payload": {
+          "compressed_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compressor": "zstd",
+          "file_digest_algorithm": 8,
+          "flags": "19",
+          "format": "cpio",
+          "sha256_algorithm": 8,
+          "uncompressed_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "schema_version": 1,
+        "scripts": {}
+      },
       "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "version": "6.18.48"
     },
@@ -17,6 +95,99 @@
       "name": "kernel-openmythos-core",
       "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64",
       "release": "1.openmythos.fc44",
+      "security_metadata": {
+        "dependencies": {
+          "conflicts": [],
+          "enhances": [],
+          "obsoletes": [],
+          "order": [],
+          "provides": [
+            {
+              "flags": 8,
+              "name": "kernel-core-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core(x86-64)",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            }
+          ],
+          "recommends": [],
+          "requires": [
+            {
+              "flags": 288,
+              "name": "/bin/sh",
+              "version": ""
+            },
+            {
+              "flags": 2304,
+              "name": "/bin/sh",
+              "version": ""
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(CompressedFileNames)",
+              "version": "3.0.4-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(FileDigests)",
+              "version": "4.6.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadFilesHavePrefix)",
+              "version": "4.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadIsZstd)",
+              "version": "5.4.18-1"
+            }
+          ],
+          "suggests": [],
+          "supplements": []
+        },
+        "files": [],
+        "forbidden_tags": [],
+        "payload": {
+          "compressed_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compressor": "zstd",
+          "file_digest_algorithm": 8,
+          "flags": "19",
+          "format": "cpio",
+          "sha256_algorithm": 8,
+          "uncompressed_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "schema_version": 1,
+        "scripts": {
+          "POSTTRANS": {
+            "argv": [
+              "/bin/sh"
+            ],
+            "body": "if [[ ${OPENMYTHOS_IMAGE_BUILD:-0} != 1 ]]; then\n  /usr/bin/kernel-install add \"6.18.48-1.openmythos.fc44.x86_64\" \\\n    \"/usr/lib/modules/6.18.48-1.openmythos.fc44.x86_64/vmlinuz\"\nfi",
+            "flags": null
+          },
+          "PREUN": {
+            "argv": [
+              "/bin/sh"
+            ],
+            "body": "if [[ $1 -eq 0 && ${OPENMYTHOS_IMAGE_BUILD:-0} != 1 ]]; then\n  /usr/bin/kernel-install remove \"6.18.48-1.openmythos.fc44.x86_64\"\nfi",
+            "flags": null
+          }
+        }
+      },
       "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
       "version": "6.18.48"
     },
@@ -27,6 +198,79 @@
       "name": "kernel-openmythos-modules",
       "nevra": "kernel-openmythos-modules-6.18.48-1.openmythos.fc44.x86_64",
       "release": "1.openmythos.fc44",
+      "security_metadata": {
+        "dependencies": {
+          "conflicts": [],
+          "enhances": [],
+          "obsoletes": [],
+          "order": [],
+          "provides": [
+            {
+              "flags": 8,
+              "name": "kernel-modules-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-modules",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-modules(x86-64)",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-modules-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            }
+          ],
+          "recommends": [],
+          "requires": [
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core-uname-r",
+              "version": "6.18.48-1.openmythos.fc44.x86_64"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(CompressedFileNames)",
+              "version": "3.0.4-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(FileDigests)",
+              "version": "4.6.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadFilesHavePrefix)",
+              "version": "4.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadIsZstd)",
+              "version": "5.4.18-1"
+            }
+          ],
+          "suggests": [],
+          "supplements": []
+        },
+        "files": [],
+        "forbidden_tags": [],
+        "payload": {
+          "compressed_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compressor": "zstd",
+          "file_digest_algorithm": 8,
+          "flags": "19",
+          "format": "cpio",
+          "sha256_algorithm": 8,
+          "uncompressed_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "schema_version": 1,
+        "scripts": {}
+      },
       "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "version": "6.18.48"
     }
@@ -40,6 +284,191 @@
       "name": "kernel-openmythos",
       "nevra": "kernel-openmythos-6.18.48-1.openmythos.fc44.src",
       "release": "1.openmythos.fc44",
+      "security_metadata": {
+        "dependencies": {
+          "conflicts": [],
+          "enhances": [],
+          "obsoletes": [],
+          "order": [],
+          "provides": [
+            {
+              "flags": 8,
+              "name": "kernel-openmythos",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-core",
+              "version": "6.18.48-1.openmythos.fc44"
+            },
+            {
+              "flags": 8,
+              "name": "kernel-openmythos-modules",
+              "version": "6.18.48-1.openmythos.fc44"
+            }
+          ],
+          "recommends": [],
+          "requires": [
+            {
+              "flags": 0,
+              "name": "bc",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "binutils",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "bison",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "dwarves",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "elfutils-libelf-devel",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "flex",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "gcc",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "kmod",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "make",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "openssl",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "openssl-devel",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "perl-interpreter",
+              "version": ""
+            },
+            {
+              "flags": 0,
+              "name": "python3",
+              "version": ""
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(CompressedFileNames)",
+              "version": "3.0.4-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(FileDigests)",
+              "version": "4.6.0-1"
+            },
+            {
+              "flags": 16777226,
+              "name": "rpmlib(PayloadIsZstd)",
+              "version": "5.4.18-1"
+            },
+            {
+              "flags": 0,
+              "name": "rsync",
+              "version": ""
+            }
+          ],
+          "suggests": [],
+          "supplements": []
+        },
+        "files": [
+          {
+            "device": 1,
+            "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "flags": 0,
+            "group": "root",
+            "inode": 1,
+            "link_target": "",
+            "path": "/6.18.48-x86_64.config",
+            "raw_mode": 33188,
+            "rdev": 0,
+            "size": 7,
+            "user": "root",
+            "verify_flags": 4294967295
+          },
+          {
+            "device": 1,
+            "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "flags": 32,
+            "group": "root",
+            "inode": 2,
+            "link_target": "",
+            "path": "/kernel-openmythos.spec",
+            "raw_mode": 33188,
+            "rdev": 0,
+            "size": 7,
+            "user": "root",
+            "verify_flags": 4294967295
+          },
+          {
+            "device": 1,
+            "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "flags": 0,
+            "group": "root",
+            "inode": 3,
+            "link_target": "",
+            "path": "/linux-6.18.48.tar.xz",
+            "raw_mode": 33188,
+            "rdev": 0,
+            "size": 7,
+            "user": "root",
+            "verify_flags": 4294967295
+          },
+          {
+            "device": 1,
+            "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "flags": 0,
+            "group": "root",
+            "inode": 4,
+            "link_target": "",
+            "path": "/module-signing.pem",
+            "raw_mode": 33188,
+            "rdev": 0,
+            "size": 7,
+            "user": "root",
+            "verify_flags": 4294967295
+          }
+        ],
+        "forbidden_tags": [],
+        "payload": {
+          "compressed_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "compressor": "zstd",
+          "file_digest_algorithm": 8,
+          "flags": "19",
+          "format": "cpio",
+          "sha256_algorithm": 8,
+          "uncompressed_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "schema_version": 1,
+        "scripts": {}
+      },
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "version": "6.18.48"
     }

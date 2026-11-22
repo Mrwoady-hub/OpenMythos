@@ -1,7 +1,7 @@
 # Gate-01 A3 Watcher Evidence Consumer Design
 
 Date: 2026-09-20
-Status: Approved design; pending written-spec review
+Status: Approved
 Scope: Task 6, Round 10, Finding A consumer validation only
 
 ## Summary

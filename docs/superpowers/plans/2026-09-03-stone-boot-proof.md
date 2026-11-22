@@ -21,7 +21,7 @@
 - `linux-openmythos` is the product label. RPM names use `kernel-openmythos`. The expected kernel release is `6.18.48-1.openmythos.fc44.x86_64`.
 - The only permitted downstream kernel patch set is the explicitly locked list in `source.lock.json`; Gate 01 starts with an empty list.
 - Gate 01 includes only firmware and drivers needed by QEMU virtual hardware. It does not include NVIDIA, the reference-hardware firmware cohort, Hyprland, Quickshell, Codex, Claude, Hermes integration, installer ISO work, MOK enrollment, Secure Boot acceptance, updates, rollback, or physical-disk writes.
-- Gate 01 PE kernel signing is deferred to Gate 02. Module signing remains enabled and uses one declared development-only key supplied from outside Git; its public identity is captured before the build and the same private key is mounted read-only into both reproducibility builders. The signed-module comparison is reproducible for that declared per-run identity; a third party needs that same external identity to reproduce signature bytes. Gate 02 replaces it with controlled release-key provisioning.
+- Gate 01 PE kernel signing is deferred to Gate 02. Module signing remains enabled and uses one declared development-only key supplied from outside Git; its public identity is captured before the build and the same private key is supplied byte-for-byte as sealed FD25 only to signing work in both reproducibility builders. The signed-module comparison is reproducible for that declared per-run identity; a third party needs that same external identity to reproduce signature bytes. Gate 02 replaces it with controlled release-key provisioning.
 - A private key, credential, generated disk, RPM, source archive, container archive, or build cache must never be committed.
 - Existing files under `open_mythos/` are not modified by this gate.
 - Network access is allowed only for the explicit input-fetch and initial toolchain-image construction steps. Kernel, RPM, payload, comparison, QCOW2, and QEMU proof steps run from locked local inputs.
@@ -78,12 +78,18 @@ tools/gate01/inputs.py                         lock validation and digest helper
 tools/gate01/toolchain.py                      builder inventory and lock validation
 tools/gate01/kernel_config.py                  config parser and requirements audit
 tools/gate01/module_key.py                     public-only module identity evidence
+tools/gate01/proof_io.py                       descriptor custody, sealing, and receipt I/O
+tools/gate01/container_runtime.py              exact Podman lifecycle and live attestation
+tools/gate01/kernel_bootstrap.py               stdlib-only held-FD entry and sealed code authority
+tools/gate01/kernel_build.py                   kernel build, inspection, and proof orchestration
+tools/gate01/oci_rootfs.py                     independent OCI merge and mounted-root audit
 tools/gate01/rpm_artifacts.py                  RPM set and installed-content manifest
 tools/gate01/oci_artifacts.py                  OCI descriptor extraction/comparison
 tools/gate01/qcow2_artifacts.py                normalized immutable-tree comparison
 tools/gate01/boot_report.py                    serial report parsing and assertions
 tools/gate01/evidence.py                       canonical final evidence assembly
 tests/gate01/fixtures/                         deliberately valid and invalid small fixtures
+tests/gate01/fixtures/oci-config-podman-5.7-crun-1.21.json  exact normalized no-hook runtime fixture
 tests/gate01/test_*.py                         fast standard-library unit tests
 docs/operations/gate01-stone-boot-proof.md     exact operator runbook and recovery guidance
 ```
@@ -1253,7 +1259,7 @@ openssl x509 -in CERT -noout -serial -subject -startdate -enddate
 
 It hashes the DER public key for `spki_sha256`, strips only the known prefixes from certificate fields, serializes sorted/indented JSON with a final newline, creates the parent directory with mode `0700`, and writes atomically with mode `0600`.
 
-The module also provides `scan --private-key KEY --root DIR`. It reads the PEM and converts it to private-key DER in memory, walks only regular files below the resolved root without following symlinks, and fails if either complete secret encoding or any PEM private-key marker occurs. It prints only offending relative paths, never matching bytes or derived fragments.
+The module also provides `scan --private-key KEY --root DIR`. It reads the PEM and converts it to private-key DER in memory, walks only regular files below the resolved root without following symlinks, and fails if either complete secret encoding or any PEM private-key marker occurs. It prints only a fixed redacted diagnostic, never matching bytes or derived fragments.
 
 - [ ] **Step 4: Implement idempotent, local-only key creation**
 
@@ -1278,7 +1284,7 @@ Verify the private/public pair by comparing the SHA-256 of `openssl pkey -pubout
 
 - Git contains the public certificate path in the config but no private key material;
 - Gate 01 uses one locally generated identity for both clean builders so RSA module signatures are comparable;
-- the private key is mounted read-only and never enters an SRPM, RPM, OCI layer, QCOW2, log, or evidence bundle;
+- the private key is supplied byte-for-byte as sealed FD25 only to signing work and secret scanners, never mounted by pathname, and never enters an SRPM, RPM, OCI layer, QCOW2, log, or evidence bundle;
 - the public certificate is included in the kernel trust set and evidence;
 - Gate 01 does not PE-sign the kernel and does not claim Secure Boot acceptance;
 - Gate 02 replaces this development identity with controlled kernel/module signing and MOK enrollment evidence.
@@ -1312,20 +1318,55 @@ git commit -m "kernel: add development module-signing boundary"
 
 **Files:**
 - Create: `os/kernel/packaging/kernel-openmythos.spec`
+- Create: `tools/gate01/proof_io.py`
+- Create: `tools/gate01/container_runtime.py`
+- Create: `tools/gate01/kernel_bootstrap.py`
+- Create: `tools/gate01/kernel_build.py`
+- Create: `tests/gate01/fixtures/oci-config-podman-5.7-crun-1.21.json`
+- Create: `tools/gate01/oci_rootfs.py`
 - Create: `tools/gate01/rpm_artifacts.py`
 - Create: `scripts/gate01/build-kernel.sh`
+- Create: `tests/gate01/test_kernel_build.py`
+- Create: `tests/gate01/test_oci_rootfs.py`
 - Create: `tests/gate01/test_rpm_artifacts.py`
 - Create: `tests/gate01/fixtures/rpm-manifest-valid.json`
 - Create: `tests/gate01/fixtures/rpm-manifest-duplicate-nevra.json`
+- Modify: `tools/gate01/module_key.py`
+- Modify: `tests/gate01/test_module_key.py`
 - Modify: `Makefile`
 
 **Interfaces:**
-- Consumes: verified source archive, final config and checksum, public certificate, read-only private key, and the exact toolchain archive.
-- Produces: one source RPM plus `kernel-openmythos`, `kernel-openmythos-core`, and `kernel-openmythos-modules` binary RPMs for release `6.18.48-1.openmythos.fc44.x86_64`; `rpm-artifacts.json`; and `installed-files.json` with normalized metadata and SHA-256 for every packaged regular file.
+- Consumes: the exact verified source archive and source lock, final config/checksum/requirements, packaging spec, public certificate/manifest, mode-`0600` private key, locked toolchain OCI archive/manifest, and the complete repository-local verifier closure. The supervisor opens every input with `O_NOFOLLOW` before validation and thereafter treats the held descriptor, not its pathname, as authoritative.
+- Produces: one genuine source RPM plus `kernel-openmythos`, `kernel-openmythos-core`, and `kernel-openmythos-modules` binary RPMs for release `6.18.48-1.openmythos.fc44.x86_64`; descriptor-originated `rpm-artifacts.json` and `installed-files.json`; public build/rootfs/container/leakage evidence; and detached receipt-last commit markers.
+- Preserves: each accepted builder tree at `build/gate01/<id>/kernel`, with RPMs at `rpmbuild/RPMS/x86_64/` and `rpmbuild/SRPMS/`. Its detached sibling receipt is `build/gate01/<id>/kernel.receipt.json`.
+- Provides: the closed launcher commands `build BUILDER`, `compare`, `meta-requirements BUILDER`, and `lifecycle-check` (builder shorthand remains supported). All production operations require held FD60 bootstrap execution, sealed ZIP FD61 and authority FD62 before creating output; direct file/module entry is unsupported. Proof pairs remain `build/gate01/compare/kernel-rpms.json` plus its receipt and `meta-requirements.json` plus its receipt.
 
-- [ ] **Step 1: Write failing RPM-manifest contract tests**
+**Trust and threat boundary:**
 
-`tests/gate01/test_rpm_artifacts.py` loads fixture JSON through `load_rpm_manifest`, then asserts that `validate_rpm_manifest`:
+- The trusted computing base is a clean initial launcher, the host kernel and filesystem, the audited absolute host tools plus Podman/crun, and exclusive custody of the build UID/process set, descriptors, private scratch, and private stores by non-malicious Gate 01 processes. The proof detects in-scope pathname replacement, in-place mutation, mutate-then-restore, unexpected writers, container-root mutation, and output replacement during the supervised run and again at every consumer boundary.
+- A hostile pre-entry loader or shell (`LD_PRELOAD`, `BASH_ENV`, exported functions), ptrace or `/proc/<pid>/fd` theft, an arbitrary active same-UID compromise, a compromised host kernel/runtime/tool binary, and coordinated replacement after a completed consumer revalidation are outside this userspace proof. `bash -p`, isolated Python, and a discarded ambient environment harden the supported launch; they do not retroactively make a hostile pre-entry process trustworthy.
+- Only the signing-capable build exec receives the sealed private-key descriptor. The supervisor may use its held key descriptor for the final leakage scan, but PID 1, live verifier, compiler probe, rootfs auditors, artifact inspector, comparison, and meta-requirements proof receive no key descriptor, pathname, hash, or key-derived value.
+- No OCI hook participates in the proof: the generated config must omit the `hooks` key entirely; any present value, including null, fails. There is an explicit residual TCB interval after start and before live attestation, during which the locked `/usr/bin/sleep`, its dynamic loader, and its mapped libraries execute. Those bytes have already been proved against the sealed OCI model, and no key, build input, artifact, or evidence descriptor is exposed during that interval; correct host-kernel/runtime enforcement remains part of the stated TCB.
+
+- [ ] **Step 1: Write failing supervisor, rootfs, and descriptor-inspection tests**
+
+`tests/gate01/test_kernel_build.py` first exercises the proof boundaries without running a kernel build. It requires:
+
+- simultaneous `O_NOFOLLOW` binding of every input, two descriptor hash passes, parent/path/listing anchors, and rejection of inode replacement, in-place mutation, and mutate-then-restore;
+- a deterministic, fully sealed verifier capsule; a private-key copy that is byte-compared into a sealed memfd without invoking SHA-256; fixed descriptor roles `20` (verifier), `21` (certificate), `22` (source), `23` (config), `24` (spec), `25` (key), `26` (build result), and `30`-`33` (SRPM/core/modules/meta);
+- a clean allowlisted subprocess environment and exact Podman create/init/config contract, including deterministic `HOME=/tmp` and `HOSTNAME=openmythos-builder`, exact namespaces/mounts, absence of the `hooks` key, and no implicit repository/input mount, proxy variable, generated hosts file, network, or image volume;
+- the only legal work path `CREATED_INIT_AUDITED -> STARTED_UNATTESTED -> LIVE_ATTESTED -> AUTHORIZED_ROOTFS_AUDITED -> WORK_AUTHORIZED`, with rejection of config replacement, an extra live process/thread/FD/mount/route/listener, the wrong PID 1 executable/mapped file/root/scratch identity or flag, a nonempty scratch directory, or any attempt to execute work before authorization;
+- one descriptor-derived `/run/.containerenv` runtime projection and one prebaseline-only VFS normalization; tests prove no normalizer runs after start, mutate-then-restore before start or during work is detected by raw anchors/audits, post-stop audit failure prevents a receipt, and cleanup attempts every container/store/scratch removal and converts cleanup failure into overall failure;
+- disk-backed anonymous `O_TMPFILE` slots, exact `1+3` RPM acquisition, rejection of extra/alternate-architecture/path-replaced outputs, positive proof that all artifact writers are reaped, closure of every writable descriptor, read-only reopen/lease, and no stable artifact pathname before final publication;
+- an exact accepted-tree allowlist, full-tree secret scan, a build report that remains `"acceptance": "pending-detached-receipt"`, `renameat2(RENAME_NOREPLACE)` publication, rollback on receipt failure, and receipt/tree revalidation by consumers.
+
+`tests/gate01/test_oci_rootfs.py` builds small OCI archives in memory and requires `canonicalize_oci_archive` and `audit_rootfs` to reject malformed descriptors/digests, duplicate JSON keys and archive paths, unsafe tar paths, unsupported nodes/xattrs, path replacement, mutation during hashing, and incomplete scans. Positive fixtures cover ordered layer replacement, explicit and implicit directories, whiteouts, opaque whiteouts, symlinks, regular and symlink hardlinks including forward/cross-layer targets, xattrs, ownership projection through the rootless UID/GID map, and exact pre/post equality.
+
+`tests/gate01/test_rpm_artifacts.py` retains the manifest fixtures and requires `load_rpm_manifest`/`validate_rpm_manifest` to enforce the existing exact NEVRA, architecture, release, ownership, mode, payload, and private-marker contract. New descriptor regressions additionally prove that RPM header query, raw hashing, `rpm2cpio`, strict newc parsing, extraction, file hashing, `modinfo`, and CMS verification consume the same immutable descriptor; they reject path rebinding, same-path replacement, post-listing mutation, malformed/trailing CPIO data, traversal, special files, hardlinks, symlink pivots, and any source RPM whose exact four-file payload differs from the declared spec/source/config/certificate hashes.
+
+`tests/gate01/test_module_key.py` adds fixed-descriptor leakage-scan cases: replacing the key pathname cannot change the scanned secret, replacing or mutating the output tree during the scan fails closed, and no private bytes or derived digest appear in output.
+
+The original manifest assertions remain mandatory:
 
 - accepts exactly one source NEVRA and these three sorted binary package names;
 - rejects duplicate NEVRAs;
@@ -1335,11 +1376,19 @@ git commit -m "kernel: add development module-signing boundary"
 - rejects a private-key suffix or the byte marker `PRIVATE KEY` in an extracted regular file;
 - accepts raw binary RPM hashes as recorded fields without using them to decide installed-content equality.
 
-- [ ] **Step 2: Run the tests and confirm the artifact API is absent**
+- [ ] **Step 2: Run the focused tests and confirm the new proof APIs are absent**
 
-Run: `python3 -m unittest tests.gate01.test_rpm_artifacts -v`
+Run:
 
-Expected: `ERROR` because `tools.gate01.rpm_artifacts` does not exist.
+```bash
+python3 -B -m unittest \
+  tests.gate01.test_kernel_build \
+  tests.gate01.test_oci_rootfs \
+  tests.gate01.test_rpm_artifacts \
+  tests.gate01.test_module_key -v
+```
+
+Expected: `ERROR` because `tools.gate01.proof_io`, `tools.gate01.container_runtime`, `tools.gate01.kernel_build`, and `tools.gate01.oci_rootfs` do not exist, followed by focused RED failures for the descriptor-only RPM and module-key interfaces before those are implemented.
 
 - [ ] **Step 3: Add the focused RPM spec**
 
@@ -1363,8 +1412,8 @@ URL:            https://www.kernel.org/
 Source0:        linux-%{version}.tar.xz
 Source1:        6.18.48-x86_64.config
 Source2:        module-signing.pem
-BuildRequires:  bc, binutils, bison, elfutils-libelf-devel, flex, gcc, make
-BuildRequires:  openssl, openssl-devel, perl-interpreter, python3, rsync
+BuildRequires:  bc, binutils, bison, dwarves, elfutils-libelf-devel, flex, gcc, make
+BuildRequires:  kmod, openssl, openssl-devel, perl-interpreter, python3, rsync
 Requires:       kernel-openmythos-core-uname-r = %{kernel_release}
 Requires:       kernel-openmythos-modules-uname-r = %{kernel_release}
 Provides:       installonlypkg(kernel)
@@ -1396,75 +1445,279 @@ The remaining spec sections must implement this exact contract:
 1. `%prep` expands Source0, copies Source1 to `.config`, and copies Source2 to `certs/openmythos-module.pem`. It fails unless `$OPENMYTHOS_MODULE_SIGNING_KEY` names a readable regular file, but it never copies or symlinks that private key into the source tree.
 2. `%build` verifies the config SHA-256 against `$OPENMYTHOS_CONFIG_SHA256`; runs `make olddefconfig`; requires the post-resolution config hash to remain unchanged; and builds `all` with `LOCALVERSION=-1.openmythos.fc44.x86_64`, `KBUILD_BUILD_VERSION=1`, `KBUILD_BUILD_USER=openmythos`, `KBUILD_BUILD_HOST=openmythos-builder`, `KBUILD_BUILD_TIMESTAMP=@1787899659`, and both `KCFLAGS` and `KAFLAGS` set to `-fdebug-prefix-map=%{_builddir}=. -fmacro-prefix-map=%{_builddir}=.`.
 3. `%install` runs `modules_install` into `%{buildroot}/usr`, then signs each uncompressed `.ko` in bytewise path order with `scripts/sign-file sha256 "$OPENMYTHOS_MODULE_SIGNING_KEY" certs/openmythos-module.pem`. `CONFIG_MODULE_SIG_ALL=n` prevents the compilation phase from signing, so signing is an explicit deterministic packaging transform. The public certificate path is the in-tree file staged during `%prep`; no ambiguous `%{SOURCE2}` expansion is used during signing. It removes `build` and `source` symlinks, copies `arch/x86/boot/bzImage` to `/usr/lib/modules/%{kernel_release}/vmlinuz`, copies `.config` to `config`, copies `System.map`, and runs `depmod -b %{buildroot}/usr %{kernel_release}`.
-4. `%files core` owns `vmlinuz`, `config`, `System.map`, `modules.builtin`, `modules.builtin.modinfo`, and `modules.builtin.alias.bin` when generated. `%files modules` owns `kernel/`, `modules.alias*`, `modules.dep*`, `modules.devname`, `modules.order`, `modules.softdep`, `modules.symbols*`, and `modules.weakdep` when generated. The meta package owns no files.
+4. An explicit empty main `%files` section forces RPM 6 to emit the fileless meta package. `%files core` owns exactly `vmlinuz`, `config`, `System.map`, `modules.builtin`, `modules.builtin.modinfo`, `modules.builtin.alias.bin`, and `modules.builtin.bin`. `%files modules` owns exactly `kernel/`, `modules.alias*`, `modules.dep*`, `modules.devname`, `modules.order`, `modules.softdep`, `modules.symbols*`, and `modules.weakdep`. No package owns any other path.
 5. `%posttrans core` calls `kernel-install add` only when `OPENMYTHOS_IMAGE_BUILD` is not `1`; `%preun core` calls `kernel-install remove` only on final erase and only when `OPENMYTHOS_IMAGE_BUILD` is not `1`. Both use the exact `%{kernel_release}` and adjacent `vmlinuz` path. The bootc payload sets `OPENMYTHOS_IMAGE_BUILD=1`, so it never creates payload-owned `/boot` content.
 6. `%changelog` begins with a fixed UTC entry dated from `SOURCE_DATE_EPOCH`; no wall-clock value is generated during a build.
 
-- [ ] **Step 4: Implement normalized RPM artifact inspection**
+- [ ] **Step 4: Implement the independent OCI semantic model and full VFS audit**
 
-`tools/gate01/rpm_artifacts.py` provides these subcommands:
+`tools/gate01/oci_rootfs.py` is independent of Podman's extraction and exposes:
 
-```text
-python3 -m tools.gate01.rpm_artifacts inspect --rpm-dir DIR --srpm-dir DIR --output JSON --extract-root DIR
-python3 -m tools.gate01.rpm_artifacts validate JSON
-python3 -m tools.gate01.rpm_artifacts compare --left JSON --right JSON --output JSON
+```python
+canonicalize_oci_archive(
+    archive_fd: int,
+    *,
+    expected_archive_sha256: str,
+    expected_manifest_digest: str,
+) -> OciRootfsManifest
+audit_rootfs(
+    root: os.PathLike[str] | str,
+    *,
+    projection: OwnershipProjection | None = None,
+) -> RootfsAudit
+assert_semantic_equal(
+    expected: OciRootfsManifest | RootfsAudit,
+    actual: OciRootfsManifest | RootfsAudit,
+) -> None
+assert_audits_equal(before: RootfsAudit, after: RootfsAudit) -> None
+project_runtime_bind_file(
+    manifest: OciRootfsManifest,
+    source_fd: int,
+    *,
+    target: str,
+    projection: OwnershipProjection | None = None,
+) -> OciRootfsManifest
+normalize_vfs_materialization(
+    root: os.PathLike[str] | str,
+    expected: OciRootfsManifest,
+    *,
+    projection: OwnershipProjection | None = None,
+    runtime_bind_targets: Iterable[str] = (),
+) -> tuple[RootfsAudit, Mapping[str, Any]]
 ```
 
-`inspect` sorts source and binary RPM paths, queries each with `rpm -qp --qf`, extracts each binary with `rpm2cpio` and `cpio --extract --make-directories --preserve-modification-time`, and rejects path traversal before extraction by checking `rpm -qpl`. Each manifest entry contains package name, epoch (`0` when absent), version, release, architecture, NEVRA, raw RPM SHA-256, and sorted files. Each file record has absolute path, type (`file` or `symlink`), mode as four octal digits, size, SHA-256 for a file, or link target for a symlink. Ownership is normalized to RPM header UID/GID names rather than the extracting host. Directories are omitted. The `inspect` subcommand runs inside the locked toolchain container so host RPM tooling is not an undeclared input; `validate` and `compare` consume JSON and run on the host with only Python.
+The canonicalizer hashes the held OCI archive itself, validates the exact index/manifest/config/blob descriptor digests and sizes, selects only the locked `linux/amd64` manifest, and merges every ordered layer in memory. It implements directory replacement, whiteouts, opaque whiteouts, regular files, directories, symlinks, and logical hardlink groups without trusting Podman's result. It rejects duplicate or unsafe archive/tar names, unsupported node types, malformed PAX/xattrs, unresolved hardlinks, and inconsistent OCI history/rootfs metadata.
 
-For every `.ko`, `inspect` runs `modinfo -F signer`, `modinfo -F sig_id`, and `modinfo -F vermagic`, and records them. Compressed modules are forbidden in Gate 01. Validation requires the signer subject `OpenMythos Gate 01 Development Module Key`, `sig_id` equal to `PKCS#7`, and vermagic beginning with the exact kernel release. `compare` fails on any source-RPM hash, NEVRA, normalized file record, or module-signature difference; it records binary RPM hash differences under `advisory_binary_rpm_hash_differences` without failing solely for that field.
+The mounted-root auditor securely opens the root without following a symlink, walks every unique actual path exactly once (including `/`), holds directory and file descriptors while reading, hashes every regular file, reads symlink targets and supported xattrs, records modes/types/sizes/ownership/hardlink groups, projects rootless host IDs through the actual Podman UID/GID map, and checks path/stat anchors after the complete pass. It must not derive the expected answer from `podman export`, an overlay diff, or a second pathname copy. For the currently locked builder archive the independent merge yields exactly `138,619` non-root paths plus a separately committed `/` entry and root anchor. Counts are supporting evidence; acceptance is equality of the complete mappings.
 
-- [ ] **Step 5: Implement the isolated offline kernel build**
+After `podman init`, open and hold the exact config-created source of `/run/.containerenv`, derive its complete runtime semantic record from that descriptor, and extend the locked OCI model by exactly that one path. The mounted materialization must therefore contain exactly `138,620` non-root paths, the separate root entry/anchor, and an explicit runtime-projection record for `/run/.containerenv`; no target bytes or mutable source pathname may supply the expected value.
 
-`scripts/gate01/build-kernel.sh BUILDER_ID` accepts only `builder-a`, `builder-b`, or `canonical`. It refuses root, resolves output to `build/gate01/BUILDER_ID/kernel`, fails if the private key is absent or not mode `0600`, verifies all locks/checksums, and recreates only that validated output directory. It imports the locked builder OCI archive into a builder-specific rootless Podman store using `--storage-driver=vfs`.
+Podman's VFS import has two documented representation losses: it does not restore directory mtimes after creating descendants, and it may materialize tar hardlinks-to-symlinks as separate symlink inodes. Exactly once, before accepting the stopped-container baseline, `normalize_vfs_materialization` first proves that the full path set is exact and that every difference is limited to those two cases or the projected `/run/.containerenv` mode/mtime. It repairs only those descriptor-anchored fields, skips no-op chmod/utime calls, rechecks every untouched raw entry, and performs a complete audit equal to the extended sealed model. No normalizer is callable after PID 1 starts. For both the signing builder and the distinct secret-free inspector, the complete `authorized` audit immediately before work and the complete post-stop audit must equal that accepted baseline in semantic and raw commitments. Any extra, missing, retyped, relinked, metadata-changed, content-changed, or mutate-then-restore path fails the run.
 
-Create `SOURCES`, `SPECS`, `BUILD`, `BUILDROOT`, `RPMS`, and `SRPMS` below the output. Copy the verified source archive, final config, and public PEM into `SOURCES`; copy the spec into `SPECS`. Then run the digest-qualified builder image with:
+The normalization evidence has exact `schema_version: 3` and `watch_profile: "linux-inotify-fanotify-vfs-normalization-v3"`. Its other six fields are `initial_raw_ledger`, `repair_groups`, `directory_mtimes`, `hardlinks`, `runtime_bind_targets`, and `raw_operations`. The complete canonical initial raw ledger, including `/`, is encoded with `zlib-base64-canonical-raw-ledger-v1`: level-9 zlib plus canonical base64, exact entry count, uncompressed size, and SHA-256. Bounds are 250,000 entries, 256 MiB uncompressed, and 16 MiB encoded. Decode requires bounded complete decompression with EOF and no trailing/multistream data, exact hash/size, canonical recompression equality, duplicate-free JSON, and parse/recanonicalize equality. Production still requires exactly 138,621 total entries (138,620 non-root); codec bounds do not relax the locked image count.
 
-- `--network=none`, `--read-only`, `--tmpfs /tmp:rw,noexec,nosuid,nodev`;
-- repository, source cache, config, and private key mounts read-only;
-- the builder output mounted read-write at `/work`;
-- `SOURCE_DATE_EPOCH=1787899659`, `TZ=UTC`, `LC_ALL=C.UTF-8`, `OPENMYTHOS_MODULE_SIGNING_KEY=/run/secrets/module-signing.key`, and the committed config SHA in `OPENMYTHOS_CONFIG_SHA256`;
-- `rpmbuild -ba --define '_topdir /work/rpmbuild' --define 'dist .fc44' --define '_smp_mflags -j4' /work/rpmbuild/SPECS/kernel-openmythos.spec`.
+`repair_groups` declares complete sorted membership with the canonical minimum-path representative. The consumer reconstructs every initial row once and replays exact, unique, ordered aggregate transitions: one `symlink_hardlink` phase covering all planned link/exchange/unlink repairs, then one `runtime_bind_target` transition per changed target (possibly chmod plus utime), then deepest-first directory-mtime transitions. `raw_operations` records these authorized aggregate phase transitions, not one row per syscall. Every before-row must equal the currently reconstructed row; representative/member/parent coverage, operation-specific fields, and displaced-inode remaining aliases/link counts are mandatory. Partially linked groups are valid only with exact initial equivalence classes and no outside or cross-group aliases. The final reconstructed complete-ledger SHA-256 and full root anchor must equal the accepted audit's `raw_sha256` and anchor; a self-consistent affected-row chain alone is not authority.
 
-Stage every source/spec file as mode `0644` with mtime `SOURCE_DATE_EPOCH`. Intentionally vary ambient inputs: builder A uses hostname `ambient-a`, outer `TZ=UTC`, and outer umask `0022`; builder B uses hostname `ambient-b`, outer `TZ=Pacific/Honolulu`, and outer umask `0077`. Both containers must overwrite these with the declared Kbuild/RPM locale, host, user, timestamp, modes, and prefix maps above. The builder ID already gives different absolute build paths. Record the ambient and declared environments in each artifact report.
+Live syscall exactness is separately enforced by the frozen v3 event machines. Inotify retains held parent/inode identities and exact initial child listings for all repaired group members, including source parents, plus each runtime/mtime target and its necessary parent/root external-parent anchor. Each random repair name has exact create -> exchange -> unlink events, exact nonzero distinct rename cookies, inode MOVE_SELF events, and explicitly bracketed zero-link watch retirement. Repair-phase parent-self ATTRIB is forbidden. Directory utime and runtime chmod/utime have separate exact dual parent/inode ATTRIB profiles; unrelated names, masks, multiplicities, overflow, watch loss, malformed data, or ambiguous/coalesced sequences fail closed. Watches are installed before ledger revalidation and an empty baseline drain, and remain authoritative through each exact operation/aggregate ledger check and terminal raw/audit drain. Authorized metadata transitions advance any surviving long-lived repair-parent authority only after their exact local proof.
 
-After the container exits, require exactly one SRPM and the three binary RPM names, run the artifact inspector inside that same locked container and run the JSON validator on the host, save the complete build stdout/stderr, compiler version, elapsed seconds, and peak output size, and run `python3 -m tools.gate01.module_key scan --private-key build/gate01/secrets/module-signing.key --root <builder-output>`. Any match fails, chmods the entire affected builder output `0700`, and reports only the path so it cannot enter release evidence.
+Inotify alone cannot distinguish external hardlink-count churn coalescing with an authorized inode ATTRIB. Every mutating syscall therefore also uses one operation-local fanotify FID group per affected inode (at most two for exchange), with exact prebound opaque filesystem ID and file handle, no child-event marks, strict bounded metadata/FID parsing, and one exact event per group. Unsupported FID/mark/filesystem/kernel profiles and all queue/setup/read errors fail closed. A fresh minimal child performs exactly one prepared raw mutating syscall; separate actors cannot merge into that child's fanotify record. PID values never authorize events. Setup requires exactly one native thread and ignored SIGPIPE. A CLOEXEC pipe blocks the child until the parent has acquired a pidfd, closed its own reader, and successfully written the exact one-byte token; only that live-reader proof authenticates the pidfd. Pre-authentication failure closes the writer and reaps without signalling. Post-authentication termination uses only that pidfd, never a numeric PID; all helper descriptors and child status have explicit cleanup ownership. The minimal helper and exclusive non-malicious UID/process execution boundary remain trusted; notification does not establish actor identity.
 
-- [ ] **Step 6: Build twice and compare package evidence**
+Immediate child listings are indexed once. Directory/runtime metadata watches are operation-local (at most three simultaneous inotify watches for a directory operation), while necessary repair watches persist through terminal verification. Work scales with ledger entries and authorized operations, not the product of directory count and ledger size. The committed 100/300/4,097-directory positive regression checks an explicit linear ledger-operation bound and watch peak; kernel resource exhaustion is fatal, never a reason to omit proof.
+
+- [ ] **Step 5: Implement fixed-descriptor RPM, CPIO, module, and leakage inspection**
+
+`tools/gate01/rpm_artifacts.py inspect-fixed-fds` receives only the sealed verifier at `20`, sealed public certificate at `21`, read-only artifact descriptors `30`-`33`, and anonymous result descriptors `40` (`rpm-artifacts.json`), `41` (`installed-files.json`), and `42` (structured inspection result). The inspector is their sole writer; after it exits, the supervisor closes the writers and reopens the evidence inodes read-only. Production inspection never reopens an RPM by pathname. Each RPM descriptor is used for its raw hash, `rpm -qp` header and file queries, `rpm2cpio`, strict `070701` newc parsing, and extraction; the validated CPIO stream is held in an anonymous descriptor and the extracted regular-file hashes must equal the bytes parsed from that same stream.
+
+The source RPM must be genuine and its payload must be exactly these four root-owned mode-`0644` regular files, with no directories, links, or extras:
+
+```text
+kernel-openmythos.spec
+linux-6.18.48.tar.xz
+6.18.48-x86_64.config
+module-signing.pem
+```
+
+Their hashes must equal the held spec/source/config/certificate inputs. The binary packages retain the exact meta/core/modules topology, root ownership, safe modes, nonempty required metadata, exact `modules.order`, and no special files, compressed modules, hardlinks, or symlink pivots. Directories are omitted only from normalized installed-file JSON; their exact header/CPIO/extracted topology is still verified.
+
+For every uncompressed `.ko`, one securely opened extracted-file descriptor supplies the file hash, private-marker scan, Linux signature trailer, DER CMS, and `modinfo` queries. Require an appended PKCS#7/CMS signature that cryptographically verifies against descriptor `21` with embedded/untrusted certificates disabled, declares SHA-256 as its CMS digest algorithm, reports signer `OpenMythos Gate 01 Development Module Key`, reports `sig_id` `PKCS#7`, and has a vermagic first token exactly equal to the kernel release. A mutation or pathname replacement between any two operations fails.
+
+`tools/gate01/module_key.py` exposes `scan_descriptors(private_key_descriptor: int, root_descriptor: int) -> int`; its `scan-fixed-fds` CLI receives the sealed key at `25` and accepted-candidate root at `50`. It derives the complete secret encodings in memory, walks held descriptors without following links, performs a final tree/path/version sweep, emits only a fixed redacted diagnostic, and never emits or computes a secret hash. The path-based Task 5 CLI may remain for compatibility, but Task 6 production code uses only the descriptor interface.
+
+Keep `validate` and pure-JSON `compare` behavior: comparison fails on the genuine SRPM hash, NEVRA set, normalized installed-file records, or module signatures, while raw binary RPM byte hashes remain recorded advisory differences. The supervisor, not a path-based inspector, owns production receipt publication.
+
+- [ ] **Step 6: Implement the descriptor-custody build supervisor**
+
+Keep the source closure split by authority. `tools/gate01/proof_io.py` owns held-input identity, fixed-descriptor projection, memfd sealing, `O_TMPFILE` slots, complete leakage scans, tree commitments, and detached receipt publication/revalidation. `tools/gate01/container_runtime.py` owns the controlled environment, Podman store/container lifecycle, exact generated-config validation, descriptor-derived runtime projection, rootfs workers, and live process/mount attestation. `tools/gate01/kernel_build.py` owns evidence schemas, build/inspection orchestration, comparison/meta proofs, and the CLI. `tools/gate01/oci_rootfs.py` remains independent of Podman. Freeze the pre-split public behavior and source hashes, move code mechanically behind these boundaries, and rerun the same focused/no-build checks before accepting the split.
+
+Resource ownership is normative across constructors, container/list registration, context/callback adoption, writes, and rollback. Every acquisition has an immediate local owner before any fallible inspection or registration; transfer occurs only after successful adoption. Context and stack callers pass non-owning factory arguments: acquisition occurs inside the established local guard, never as an already-open argument awaiting a later context/adoption call. Terminal cleanup drains existing ownership incrementally, detaching each current numeric/object field before its single kernel-close attempt; it must not allocate an action list, tuple, closure, or exception snapshot before attempting release. Any genuinely retryable owner plan must remain intact on formation failure, but automatic terminal unwinds cannot rely on an unavailable caller retry. Exception snapshots use the nonallocating `sys.exception()` scalar (supported by the required Python 3.12+), or explicit exception binding, rather than allocating `sys.exc_info()` tuples. Attempt every independently authorized cleanup even if earlier actions fail. Preserve an existing primary exception object unchanged and attach best-effort fixed nonsensitive category notes; with no primary, aggregate cleanup errors and fail. These rules apply before the durable receipt boundary; only the explicitly post-durable local close/unlock/output path may issue a fixed warning while retaining success. Public output readback must bind actual stored bytes to the caller's original supplied bytes before returning an identity or publishing; this never authorizes a private-key digest.
+
+Store initialization holds the exact parent/listing and a bounded creation watch before mkdir, immediately opens the created directory into a local numeric guard, and retains original custody before later validation/registration. A first observation/open failure may remove only the uniquely proved just-created empty directory using exact CREATE/DELETE|ISDIR provenance and restored parent listing/link count. Move/replacement/extra/ambiguous events forbid deletion and produce a fixed cleanup diagnostic rather than adopting a replacement. A failed current initialization never falls back to stale-store pathname acquisition. Material cleanup retains its original held custody through every authorized attempt, continues eligible siblings after command/removal failures, then independently releases all scope. Released scope is terminal and cannot be retried to reacquire a recreated pathname. Container creation/start attempts conservatively retain exact invocation ownership before the command can take effect, including a policy-finalizer failure after subprocess completion; output parsing or later validation cannot discharge that ownership. Stop/wait ambiguity retains the exact-authorized fallback stop/force-removal path. Store cleanup separately captures its subprocess outcome in a caller-owned completion cell before policy finalization: only proven returncode-zero completion enables the existing bounded safe recreated-bookkeeping cleanup. Nonzero or unproven completion never authorizes adopting replacement children, and the original policy/command exception remains fatal after all independently authorized cleanup.
+
+`scripts/gate01/build-kernel.sh build BUILDER_ID` accepts only `builder-a`, `builder-b`, or `canonical`, refuses root, resolves every work path below `build/gate01/`, and performs this fail-closed lifecycle:
+
+1. Install cleanup before creating state. Open and hold the exact helper closure (`tools/__init__.py`, `tools/gate01/__init__.py`, `inputs.py`, `kernel_bootstrap.py`, `kernel_config.py`, `toolchain.py`, `module_key.py`, `proof_io.py`, `container_runtime.py`, `rpm_artifacts.py`, `oci_rootfs.py`, and `kernel_build.py`), launcher, spec, source/toolchain locks, source/toolchain archives, config/checksum/requirements, public certificate/manifest, and private key. Require exact regular-file identity/mode/link count as applicable, two stable reads, exact parent/listing anchors, and all declared hashes. Reuse the exact executed sealed bootstrap ZIP as the verifier, copy build public inputs into sealed memfds, and byte-compare the private key into a fully sealed memfd without hashing it. Discard the ambient environment and use absolute audited executable paths.
+2. Independently canonicalize the exact held toolchain archive, create fresh builder-specific VFS graphroot/runroot/tmp/scratch directories outside the future accepted tree, and load the archive through its held descriptor. Verify the imported image's manifest and config identities against the lock.
+3. `podman create` an offline, read-only-root container with `--network=none`, `--no-hostname`, `--no-hosts`, `--image-volume=ignore`, `--http-proxy=false`, `--unsetenv-all`, a hardened `/tmp` tmpfs, deterministic `HOME=/tmp` and `HOSTNAME=openmythos-builder`, and exactly one private bind at `/tmp/work`. The scratch bind is `rw,nosuid,nodev,rbind` and may execute because Kbuild runs newly built helpers; no repository, source, key, output, store, or default host path is mounted. Run `podman init`, then bind the exact generated OCI config and its exact runtime-created `.containerenv` source with `O_NOFOLLOW`. Before the initial child bind/baseline, install one coalesced inotify watch per held parent inode. At every transition rehash/re-stat the held targets, revalidate each target name and parent path identity, require all stable parent metadata plus the exact baseline listing, and reject target-basename modify/close-write/attribute/create/delete/move events, watch loss/self-move/unmount, queue overflow, or malformed events. Podman's transient exec bookkeeping may advance only parent mtime/ctime and may emit only events for unrelated sibling names that are absent again at the final exact-listing boundary. Require the config's root path, ordered environment, capabilities, namespaces, process command, ten exact mounts and sources, readonly/masked paths, and absence of the `hooks` key; reject every extra field that changes the security contract.
+4. While PID 1 has never run, mount the stopped container. Extend the sealed OCI mapping from the held `.containerenv` descriptor by exactly `/run/.containerenv`, require `138,619` locked non-root paths plus that one runtime projection and the separate root entry/anchor, and perform the one permitted prebaseline VFS normalization described in Step 4. Record its complete bounded delta, then require a full exact semantic/raw audit and transition to `CREATED_INIT_AUDITED`. No hook is installed or invoked, and no later phase may normalize the rootfs.
+5. Start only inert `/usr/bin/sleep infinity`, entering `STARTED_UNATTESTED` without exposing a key, public build input, artifact, or evidence descriptor. Host-side live attestation must observe exactly one PID/cgroup with the expected executable and audited mapped loader/libraries, command line, ordered environment, UID/GID, zero capabilities, `NoNewPrivs`, seccomp, cwd, namespaces, thread/child/process set, stdio-only descriptor set, exact mount topology and bind-source identities, loopback-only network with no listener/route, and an empty anchored scratch directory. A nonce-bound, secret-free verifier exec receives only sealed descriptor `20` and independently proves the readonly root and exact scratch/mount contract from inside; after it exits, require the exact one-process set to return, repeat the host record byte-for-byte, and revalidate both watched runtime inputs under the target-event policy above. Only then enter `LIVE_ATTESTED`. Perform a complete semantic/raw rootfs audit equal to the prebaseline and a final watched-config/process check immediately before the explicit `WORK_AUTHORIZED` transition. Run the keyless compiler probe only after authorization.
+6. Create four anonymous, disk-backed `O_TMPFILE` artifact slots on a private filesystem and pass fixed descriptors `20`-`26` and `30`-`33` only to the build exec. Stage source/config/certificate/spec from `22`/`23`/`21`/`24` into the private rpmbuild tree as mode `0644` with mtime `1787899659`; invoke absolute `/usr/bin/rpmbuild` with key `/proc/self/fd/25`, the fixed config hash, fixed locale/timezone/build user/build host/timestamp/prefix maps, and `-j4`. Mark the artifact slots close-on-exec so rpmbuild and its children never inherit them.
+7. After rpmbuild and every descendant exit, acquire exactly one SRPM and the three exact binary RPM names directly into slots `30`-`33`; reject all extra entries before and after copying. Prove no live process holds a writable artifact descriptor, close every writer, reopen each anonymous inode read-only, acquire the supported read lease, and recheck size/content/inode/link-count identity. The artifacts remain anonymous and supervisor-held.
+8. Immediately before stop, require a clean watched-input boundary and the prevalidated exact owner/mode/type/inode metadata for the `attach` socket and `ctl`/`winsz` FIFOs. During stop, require this exact per-name partial order: `attach` emits one zero-cookie `IN_DELETE`; `ctl` and `winsz` each emit one zero-cookie `IN_CLOSE_WRITE` followed later by one zero-cookie `IN_DELETE`. Cross-name interleaving is unconstrained, but the watched descriptor, basename bytes, masks, cookies, multiplicity, and per-name order are exact; reject every duplicate, extra mask/event/name, target event, queue overflow, or watch loss. Immediately afterward require the config-parent listing to equal its baseline minus exactly those endpoints, require every surviving entry and both bound targets to retain their complete pre-stop metadata/content/path identities, record both the event multiset and observed sequence together with the pre/post listings, endpoint metadata, and exact allowed delta, and adopt the reduced listing as the post-stop baseline. Then run the complete post-rootfs audit without normalization. Require its semantic mapping to equal the extended independent OCI model and require its semantic/raw record to equal the prebaseline and authorized audit records. Then remove the container, scratch, and every signing-capable store/runtime path. Any post-audit or cleanup failure invalidates the run and permits no receipt.
+9. Import the same held OCI archive into a different fresh secret-free inspector store and container. Repeat the complete no-hook sequence `CREATED_INIT_AUDITED -> STARTED_UNATTESTED -> LIVE_ATTESTED -> AUTHORIZED_ROOTFS_AUDITED -> WORK_AUTHORIZED`, including its own descriptor-bound `.containerenv` projection, one-time prebaseline normalization evidence, host/inside live attestation, authorized rootfs recheck, post-stop audit, and cleanup. Only its work exec receives sealed verifier `20`, certificate `21`, read-only artifacts `30`-`33`, and anonymous evidence/result outputs `40`/`41`/`42` for `rpm_artifacts.py inspect-fixed-fds`; the inspector lifecycle receives neither key `25` nor a key pathname, environment value, hash, or key-derived value.
+10. Revalidate all held public inputs and anonymous artifacts. Copy only the four read-only RPM descriptors and two canonical evidence descriptors into a hidden candidate output; create canonical public logs/evidence with the build report still pending; then run the full descriptor-only private-key leakage scan over that exact candidate.
+11. Require the candidate to contain exactly the following regular files and their implied directories, with no symlink, hardlink, special file, empty undeclared directory, extraction tree, or scratch residue:
+
+```text
+rpmbuild/RPMS/x86_64/kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64.rpm
+rpmbuild/RPMS/x86_64/kernel-openmythos-core-6.18.48-1.openmythos.fc44.x86_64.rpm
+rpmbuild/RPMS/x86_64/kernel-openmythos-modules-6.18.48-1.openmythos.fc44.x86_64.rpm
+rpmbuild/SRPMS/kernel-openmythos-6.18.48-1.openmythos.fc44.src.rpm
+rpm-artifacts.json
+installed-files.json
+build.log
+compiler-version.txt
+build-report.json
+source-capsule.json
+rootfs-audit.json
+container-contract.json
+leakage-scan.json
+```
+
+`rootfs-audit.json` records, for both builder and inspector, the locked `138,619` non-root count, separate root entry/anchor, one-path runtime projection, materialized count, and prebaseline/authorized/post semantic and raw commitments plus equality verdicts. `container-contract.json` records the exact config/fixture hashes, `hooks_present=false`, actual sealed containers/storage policy hashes, store/scratch/runtime-input bindings, the exact post-stop event partial order, image authority basis, bounded prebaseline VFS-normalization delta, and host/inside live attestations including held userns ownership projection and the complete 33-row canonical mount graph. State transitions belong to `rootfs-audit.json`; before/authorized/after records must be fully equal. `source-capsule.json` records public input identities, the full ordered bootstrap authority, and exact executed/verifier capsule hashes; `leakage-scan.json` records completion/verdict without a key hash or matched bytes. `SOURCES`, `SPECS`, `BUILD`, `BUILDROOT`, extracted files, runtime snapshots, Podman state, and scratch are forbidden from the accepted tree.
+
+12. Fsync the complete candidate, calculate its exact type/mode/UID/GID/size/hash tree commitment, atomically rename it without replacement to `build/gate01/<id>/kernel`, fsync the parent, and publish `build/gate01/<id>/kernel.receipt.json` last through another no-replace/fsync sequence. If receipt publication fails, roll the tree back; if any earlier operation or cleanup fails, publish neither final tree nor receipt. The receipt commits the intended absolute path, complete tree, source-capsule hash, and inspector-originated RPM-manifest hash. Every later consumer must open and revalidate the detached receipt plus all 13 semantically validated files through a coherent held descriptor view, with no xattrs and explicit nonzero expected UID/GID (future rootful consumers use validated SUDO_UID/SUDO_GID). Every acceptance check and material cleanup precedes final receipt-parent fsync. Once that fsync succeeds, no rollback or fallible revalidation occurs: remaining process-local close/unlock/output failures emit fixed warnings while preserving success.
+
+Builder A and canonical retain outer timezone `UTC` and umask `0022`; builder B retains outer timezone `Pacific/Honolulu` and umask `0077`. The supervisor rejects any other environment or inherited umask before creating state. Different host scratch/store/output paths provide path variation. Both build execs receive the same controlled container environment and record the outer/declaration split without attempting an injected hostname file.
+
+- [ ] **Step 7: Replace the shell driver with a hardened thin launcher**
+
+`scripts/gate01/build-kernel.sh` uses `#!/bin/bash -p`, a closed argument grammar, exact builder-specific outer timezone/umask, fixed PATH/locale and absolute runtime tools. It rejects root and unsupported Bash/loader/Python startup variables. Its non-symlink physical repository path is authoritative. Opening FD60 on `tools/gate01/kernel_bootstrap.py` is the trusted clean-launch instant; isolated stdlib-only Python validates its own descriptor and all 13 ordered source paths before any repository package import. It seals executable ZIP FD61 plus canonical authority FD62, closes FD60, and dispatches the requested command. The same held closure is rechecked at the final pre-receipt boundary.
+
+```sh
+scripts/gate01/build-kernel.sh build builder-a
+scripts/gate01/build-kernel.sh build builder-b
+scripts/gate01/build-kernel.sh compare
+scripts/gate01/build-kernel.sh meta-requirements builder-a
+# Keyless integration, only when explicitly authorized:
+scripts/gate01/build-kernel.sh lifecycle-check
+```
+
+The inherited application-FD matrix is exact (standard FDs 0–2 are separate):
+
+| Role | Inherited application descriptors |
+|---|---|
+| Clean launcher/bootstrap | FD60, then sealed executable FD61 + canonical authority FD62; close FD60 |
+| Inert PID1 / compiler probe | None |
+| Live/no-build verifier | FD20 sealed verifier |
+| OCI summary worker | FD18 archive + FD20 verifier |
+| Rootfs audit worker | FD18 archive + FD19 runtime containerenv + FD20 verifier |
+| Public input audit | FD20 verifier + FD21 certificate + FD50–57 exact public input-audit roles; no FD25 |
+| Signing build wrapper | FD20–26 + FD30–33; FD21–24 are certificate/source/config/spec, FD25 sealed key, FD26 result |
+| Artifact inspector | FD20, FD21, read-only FD30–33, output FD40/41/42 (RPM manifest/installed manifest/result) |
+| Meta worker | FD20 + read-only FD33 only |
+| Secret tree scanner | FD20 + FD25 + FD50 held tree |
+| Secret artifact scanner | FD20 + FD25 + read-only FD30–33 |
+
+The host retains FD61/62 as executing authority but does not forward them to
+container workers. Writer probes, writer close, second probes, read-only reopen,
+read leases and terminal identity checks cover artifacts and every anonymous
+manifest/result/log output. Pathname `rpm_artifacts inspect` is retired and
+refuses before traversal; inspection authority is `inspect-fixed-fds` only.
+
+The launcher contains no container, key, artifact, scan, cleanup or publication logic. Builder shorthand (`builder-a`, `builder-b`, `canonical`) remains supported for `make gate01-kernel` compatibility. No production command directly executes a mutable `kernel_build.py` path.
+
+- [ ] **Step 8: Add receipt-bound comparison and meta-requirements proofs**
 
 Run:
 
 ```bash
-scripts/gate01/build-kernel.sh builder-a
-scripts/gate01/build-kernel.sh builder-b
-python3 -m tools.gate01.rpm_artifacts compare \
-  --left build/gate01/builder-a/kernel/rpm-artifacts.json \
-  --right build/gate01/builder-b/kernel/rpm-artifacts.json \
-  --output build/gate01/compare/kernel-rpms.json
+scripts/gate01/build-kernel.sh compare
+scripts/gate01/build-kernel.sh meta-requirements builder-a
 ```
 
-Expected: source RPM hashes match, package NEVRAs match, installed file manifests including module signatures match, and the comparison verdict is `pass`. Binary RPM byte differences, if present, appear only in the named advisory field and must have a documented RPM-header cause before Gate 01 can be declared green.
+`compare` first revalidates both `kernel.receipt.json` files and both complete builder trees while holding the exact RPM/manifests, then writes canonical `build/gate01/compare/kernel-rpms.json`. The comparison requires byte-identical genuine SRPMs, exact NEVRAs, installed files, and module signatures; raw binary-RPM differences are advisory only and require a documented RPM-header cause before a green gate. After all inputs are revalidated and temporary state is cleaned, publish `build/gate01/compare/kernel-rpms.receipt.json` last with the same no-replace/fsync/rollback protocol. It requires identical strict source capsules and hard-compares all security metadata. Its commitment includes the comparison file and both input receipt/tree/capsule hashes.
 
-Run the locked toolchain container offline with the builder-A RPM directory mounted read-only and execute: `rpm -qp --requires /rpms/kernel-openmythos-6.18.48-1.openmythos.fc44.x86_64.rpm`.
+`meta-requirements` revalidates the selected builder receipt/tree, supplies only sealed verifier FD20 and exact read-only meta-RPM FD33 to a new offline secret-free locked-image container. `rpm_artifacts meta-fixed-fd` independently validates identity, fileless policy, the complete framed RPM security metadata, compressed payload digest and full CPIO digest. It rejects every unexpected inherited application FD and returns strict canonical JSON. Full dependency tuples, including RPM-generated capabilities, are validated without filtering or deduplication; the result contains these exact two uname dependencies:
 
-Expected: exact core and modules uname requirements appear.
+```text
+kernel-openmythos-core-uname-r = 6.18.48-1.openmythos.fc44.x86_64
+kernel-openmythos-modules-uname-r = 6.18.48-1.openmythos.fc44.x86_64
+```
 
-- [ ] **Step 7: Run unit and leakage tests**
+The meta query uses another fresh secret-free store/container and the same no-hook init/live/authorized/post lifecycle; it receives no key or build input, and no proof is publishable if its post-audit or cleanup fails. After that lifecycle completes, write canonical `build/gate01/compare/meta-requirements.json` and publish `build/gate01/compare/meta-requirements.receipt.json` last with the same no-replace/fsync/rollback protocol. Its commitment includes the proof file, exact meta-RPM hash, and selected builder receipt/tree hash. Task 7, Task 10, the release gate, and every manual consumer must reject a missing/replaced receipt and revalidate the committed file/tree immediately before use.
 
-Run: `python3 -m unittest tests.gate01.test_rpm_artifacts -v`
+- [ ] **Step 9: Run the no-build verification and fresh review gate**
 
-Expected: all fixture tests pass.
+The no-build evidence commits schema version 1, the complete canonical bootstrap
+authority and its SHA-256, the executed sealed capsule SHA-256, the full locked OCI
+summary, selected public toolchain lock/archive hashes, and the canonical scoped
+base/current manifest plus SHA-256. Its scope is sealed in `proof_io.py`: public
+roots `tools/gate01`, `scripts/gate01`, `tests/gate01`, `os/kernel/config`,
+`os/kernel/packaging`; explicit files `tools/__init__.py`, `Makefile`,
+`os/kernel/Containerfile.builder`, `os/kernel/README.md`,
+`os/kernel/source.lock.json`, `os/build/toolchain.lock.json`, and these exact
+architecture/plan documents. Never walk `os/kernel/keys`, `build` (including
+secrets), `.git`, or `.superpowers` for current-source evidence; public
+certificates/manifests require their separate explicitly authorized input policy.
 
-Run: `rg -uuu -l 'BEGIN (RSA |EC |)PRIVATE KEY' os tools scripts tests docs .github || true`
+Use absolute trusted Git plumbing at immutable base
+`cfc94e5437dac3f80deed3bad70c3d56ae4840a1`, without replacements, hooks, fsmonitor,
+index, ignore rules or filters as authority. Record raw relative path bytes as
+hex, immutable base Git mode/OID and direct current type/full mode/file size/SHA-256,
+including unchanged tracked files, deletions, untracked files and directories.
+Only untracked `__pycache__` components are excluded. Reject symlinks, special
+nodes, hardlinked regular files and xattrs. Hold the original source files,
+directories and ancestor identities through the lifecycle and all material
+cleanup; two-pass terminal hash/version/listing checks and exact 13-file
+bootstrap mode/size/hash cross-binding run again after cleanup.
 
-Expected: no tracked Gate 01 file is listed.
+The no-build record preserves full equal before/authorized/after rootfs records,
+all ten transitions, exact config/fixture/sealed-policy identities, store and
+runtime-input bindings, normalization and live userns/mount evidence. It sets
+`cleanup={container_removed:true,store_removed:true,temporary_tree_removed:true,
+scope_revalidated_after_cleanup:true,verdict:"pass"}` only after every operation
+succeeds. Cleanup errors already prevent return; holding/rechecking authority
+through that interval is additionally mandatory.
 
-- [ ] **Step 8: Commit kernel packaging and inspection**
+Run:
+
+```bash
+python3 -B -m unittest \
+  tests.gate01.test_kernel_build \
+  tests.gate01.test_oci_rootfs \
+  tests.gate01.test_rpm_artifacts \
+  tests.gate01.test_module_key -v
+python3 -B -m unittest discover -s tests/gate01 -p 'test_*.py' -v
+python3 -m py_compile \
+  tools/gate01/proof_io.py tools/gate01/container_runtime.py \
+  tools/gate01/kernel_bootstrap.py tools/gate01/kernel_build.py tools/gate01/oci_rootfs.py \
+  tools/gate01/rpm_artifacts.py tools/gate01/module_key.py \
+  tests/gate01/test_kernel_build.py tests/gate01/test_oci_rootfs.py \
+  tests/gate01/test_rpm_artifacts.py tests/gate01/test_module_key.py
+bash -n scripts/gate01/build-kernel.sh
+shellcheck scripts/gate01/build-kernel.sh
+git diff --check
+git grep -l -I -E '^-----BEGIN (RSA |EC )?PRIVATE KEY-----$' -- os tools scripts tests docs .github
+# Expected exit is exactly 1 (no header); any other exit needs investigation.
+# Also review every explicitly scoped untracked Task 6 source/fixture.
+```
+
+After explicit controller authorization, separately run:
+
+```bash
+scripts/gate01/build-kernel.sh lifecycle-check
+```
+
+Expected: every focused and full Gate 01 unit test passes; the real no-build lifecycle imports the held locked archive into a disposable VFS store and proves the exact no-hook state machine, descriptor-derived runtime projection, one-time prebaseline normalization, live process/mount contract, three rootfs audits, and cleanup without acquiring a key or publishing output; compilation, Bash syntax, ShellCheck, and diff checks pass; and the tracked-tree marker scan lists no private key. Freeze the exact scoped diff/source identities and obtain fresh specification and code-review approval of the lifecycle, OCI semantics, descriptor flow, output allowlist, cleanup, and receipt protocol before launching either multi-hour build.
+
+- [ ] **Step 10: Build twice and publish all four detached receipts**
+
+Run only after Step 9 approval:
+
+```bash
+scripts/gate01/build-kernel.sh builder-a
+scripts/gate01/build-kernel.sh builder-b
+scripts/gate01/build-kernel.sh compare
+scripts/gate01/build-kernel.sh meta-requirements builder-a
+```
+
+Expected: both complete rootfs-audited build/inspection runs pass; both builder receipts revalidate; `kernel-rpms.json` has verdict `pass`; `meta-requirements.json` contains the exact two uname requirements; all four detached receipts are last-write commit markers; and the source/helper/diff identities recorded before launch remain unchanged afterward. No accepted runtime, extraction, scratch, signing store, inspection store, writable artifact descriptor, or unreceipted output remains.
+
+- [ ] **Step 11: Commit kernel packaging and inspection**
 
 ```bash
 git add Makefile os/kernel/packaging/kernel-openmythos.spec \
-  tools/gate01/rpm_artifacts.py scripts/gate01/build-kernel.sh \
-  tests/gate01/test_rpm_artifacts.py tests/gate01/fixtures/rpm-manifest-*.json
+  scripts/gate01/build-kernel.sh \
+  tools/gate01/proof_io.py tools/gate01/container_runtime.py \
+  tools/gate01/kernel_bootstrap.py tools/gate01/kernel_build.py tools/gate01/oci_rootfs.py \
+  tools/gate01/rpm_artifacts.py tools/gate01/module_key.py \
+  tests/gate01/test_kernel_build.py tests/gate01/test_oci_rootfs.py \
+  tests/gate01/test_rpm_artifacts.py tests/gate01/test_module_key.py \
+  tests/gate01/fixtures/rpm-manifest-*.json \
+  tests/gate01/fixtures/oci-config-podman-5.7-crun-1.21.json \
+  docs/superpowers/plans/2026-09-03-stone-boot-proof.md \
+  docs/superpowers/specs/2026-08-31-openmythos-os-architecture-design.md \
+  os/kernel/README.md
 git commit -m "kernel: package signed OpenMythos kernel RPMs"
 ```
 
@@ -1486,7 +1739,7 @@ git commit -m "kernel: package signed OpenMythos kernel RPMs"
 - Modify: `Makefile`
 
 **Interfaces:**
-- Consumes: the digest-pinned Fedora 44 bootc base and one validated OpenMythos RPM set.
+- Consumes: the digest-pinned Fedora 44 bootc base and one accepted Task 6 RPM set only through its detached sibling `build/gate01/<id>/kernel.receipt.json`. Before opening any RPM, the consumer uses the Task 6 receipt primitives from `tools/gate01/proof_io.py` to bind and revalidate the receipt, its intended absolute tree path, the complete exact 13-file tree commitment, and the committed inspector manifest.
 - Produces: `build/gate01/BUILDER_ID/payload/openmythos-gate01.oci.tar`, a digest-qualified OCI descriptor report, a bootc layout report, and a payload that emits one `OPENMYTHOS_BOOT_REPORT=<compact-json>` line only when booted with `openmythos.gate01=1`.
 
 - [ ] **Step 1: Write failing OCI parser tests**
@@ -1680,7 +1933,7 @@ The literal digest values are computed, not copied. Archive SHA is advisory; man
 
 - [ ] **Step 9: Implement isolated payload construction and validation**
 
-`scripts/gate01/build-payload.sh BUILDER_ID` requires invocation through `sudo` from a non-root account, requires numeric nonzero `SUDO_UID`/`SUDO_GID`, and accepts the same three builder IDs as the kernel script. It uses only `build/gate01/BUILDER_ID/kernel/RPMS/x86_64`, verifies that set through `rpm_artifacts validate`, copies `Containerfile` plus `files/` to a fresh context below the builder output, renders the release env there from locked values, and rejects secrets by filename and content before building. It sets all staged rootfs files to their committed modes and `SOURCE_DATE_EPOCH`, fixes directories to `0755`, and fails if a symlink is not explicitly expected; checkout mtimes and the invoking umask therefore cannot enter a layer.
+`scripts/gate01/build-payload.sh BUILDER_ID` requires invocation through `sudo` from a non-root account, requires numeric nonzero `SUDO_UID`/`SUDO_GID`, and accepts the same three builder IDs as the kernel script. Immediately before using an RPM, it opens the sibling `build/gate01/BUILDER_ID/kernel.receipt.json` without following links, rejects a missing/replaced/malformed receipt, and revalidates its intended absolute path, complete `build/gate01/BUILDER_ID/kernel` tree commitment, and inspector-manifest commitment. Only after that consumer-boundary check may it consume the exact three files in `build/gate01/BUILDER_ID/kernel/rpmbuild/RPMS/x86_64`; path-based `rpm_artifacts validate` is an additional semantic check, not the artifact authority. It copies `Containerfile` plus `files/` to a fresh context below the builder output, renders the release env there from locked values, and rejects secrets by filename and content before building. It sets all staged rootfs files to their committed modes and `SOURCE_DATE_EPOCH`, fixes directories to `0755`, and fails if a symlink is not explicitly expected; checkout mtimes and the invoking umask therefore cannot enter a layer.
 
 Use a builder-specific Podman `--root`, `--runroot`, and rootful `--storage-driver=overlay` below `build/gate01/BUILDER_ID/podman`. Import the cached Fedora base archive, tag its selected manifest with the exact digest-qualified source name, and build tag `localhost/openmythos/gate01:BUILDER_ID`. Extract the faketime library from the digest-verified toolchain archive into that builder's private work directory, record its SHA-256, and pass read-only volumes for it and `<absolute-rpm-dir>:/run/kernel-rpms:ro` with the offline flags from Step 7. Export with Skopeo to `payload/openmythos-gate01.oci.tar` and inspect it through the Python tool. Finally chmod artifact/report files `0644`, directories `0755`, and chown only the payload output (not the isolated container store) to `SUDO_UID:SUDO_GID` so unprivileged comparison can read it.
 

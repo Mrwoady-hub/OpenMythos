@@ -16,7 +16,7 @@ URL:            https://www.kernel.org/
 Source0:        linux-%{version}.tar.xz
 Source1:        6.18.48-x86_64.config
 Source2:        module-signing.pem
-BuildRequires:  bc, binutils, bison, elfutils-libelf-devel, flex, gcc, make
+BuildRequires:  bc, binutils, bison, dwarves, elfutils-libelf-devel, flex, gcc, make
 BuildRequires:  kmod, openssl, openssl-devel, perl-interpreter, python3, rsync
 Requires:       kernel-openmythos-core-uname-r = %{kernel_release}
 Requires:       kernel-openmythos-modules-uname-r = %{kernel_release}
